@@ -1,7 +1,7 @@
 {
   "name": "dsh-custom-reasoning-effort",
-  "description": "Fill missing reasoning-effort metadata for custom DSH LLM providers so the official picker works",
-  "version": "0.1.0",
+  "description": "Backfill per-model capability metadata (reasoning efforts and input modalities) for custom DSH LLM provider routes",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
