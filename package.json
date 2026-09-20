@@ -1,0 +1,34 @@
+{
+  "name": "dsh-custom-reasoning-effort",
+  "description": "Fill missing reasoning-effort metadata for custom DSH LLM providers so the official picker works",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "engines": { "node": ">=20.19.0" },
+  "repository": { "type": "git", "url": "git+https://github.com/Pheobe-Southwood/dsh-custom-reasoning-effort.git" },
+  "bugs": { "url": "https://github.com/Pheobe-Southwood/dsh-custom-reasoning-effort/issues" },
+  "homepage": "https://github.com/Pheobe-Southwood/dsh-custom-reasoning-effort#readme",
+  "keywords": ["deepseek-harness", "dsh", "llm", "reasoning-effort", "settings", "cordis"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.2" },
+  "license": "MIT",
+  "files": ["cordis.patch.yml", "lib", "README.md", "CONTEXT.md", "docs", "LICENSE"],
+  "scripts": {
+    "lint": "eslint .",
+    "test:host": "node --test test/*.test.mjs",
+    "test:mount": "node test/mount-check.mjs",
+    "test": "npm run test:host && npm run test:mount",
+    "test:pack": "npm pack --dry-run",
+    "check": "npm run lint && npm test && npm run test:pack",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.10.0",
+    "globals": "17.12.0"
+  }
+}

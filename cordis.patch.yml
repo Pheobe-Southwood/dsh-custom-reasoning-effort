@@ -1,0 +1,27 @@
+# The dsh-custom-reasoning-effort bundle patch: one row, applied when a profile
+# lists this package in its `dsh.profile.bundles`.
+#
+# `dsh plugin --profile <name> add` maintains that list automatically (the
+# reconcile step in the dsh CLI appends every dependency declaring
+# `dsh.bundle`), so this file is the only wiring an installation needs — users
+# never hand-edit their profile's cordis.patch.yml for this plugin.
+#
+# Two parity rules keep the mount honest, both guarded by
+# `test/mount-check.mjs`:
+#   - `name` must be this package's name, so the Loader resolves the row (and
+#     therefore the code it mounts) from the profile's node_modules;
+#   - `id` must equal the `name` the host half exports (`lib/index.js`), so the
+#     row and the plugin are recognizably the same thing.
+#
+# The row must stay a single entry: the include inserts rows verbatim and the
+# Loader rejects a repeated entry id (`duplicate loader entry id`), so a
+# hand-written copy of this row left in the profile patch layer is a boot
+# failure, not a harmless duplicate.
+#
+# The plugin publishes no service (it only normalizes the persisted settings
+# the `llm-pi-ai` adapter already reads), so it sits loose in the host root
+# realm — no `isolate` realm and no `config:` block are needed here.
+
+- insert:
+    - id: custom-reasoning-effort
+      name: dsh-custom-reasoning-effort
