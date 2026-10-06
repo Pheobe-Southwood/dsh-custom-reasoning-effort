@@ -40,10 +40,30 @@ assert.equal(
   undefined,
   'this plugin has no client half, so it must not declare dsh.client',
 )
+
+// --- runtime dependencies ---------------------------------------------------
+//
+// The reclaim marker needs a settings namespace of this plugin's own, and the
+// settings service derives those from active Loader entries whose runtime
+// declares a `Config` schema (`dsh-settings/lib/index.js:539`). That is the one
+// reason this package ships a runtime dependency at all, so the set is pinned
+// here rather than left to grow: it is the harness's own schema library, versioned
+// in lockstep with the harness, and nothing else.
+const allowedRuntimeDependencies = ['@deepseek-ai/schemastery']
+const runtimeDependencies = Object.keys(manifest.dependencies ?? {}).sort()
+assert.deepEqual(
+  runtimeDependencies,
+  allowedRuntimeDependencies,
+  `the only runtime dependency may be ${allowedRuntimeDependencies.join(', ')}: it is what makes the plugin's own row configurable`,
+)
+for (const [dependency, range] of Object.entries(manifest.dependencies ?? {})) {
+  assert.equal(typeof range, 'string', `${dependency} must pin a range`)
+  assert.ok(range.length > 0, `${dependency} must pin a range`)
+}
 assert.equal(
-  manifest.dependencies === undefined || Object.keys(manifest.dependencies).length === 0,
-  true,
-  'a plugin with no runtime dependencies cannot drift with the harness',
+  manifest.dependencies?.['@deepseek-ai/schemastery'],
+  '~3.18.4',
+  'the schema library is pinned to the harness-compatible line, so a drift can only come from an explicit edit',
 )
 
 // --- the bundle declaration and the file it points at -----------------------
@@ -63,7 +83,31 @@ assert.equal(typeof entry.apply, 'function', 'apply is exported')
 assert.deepEqual(
   entry.inject,
   ['llm', 'settings'],
-  'the entry declares the catalog and settings services it needs',
+  'the entry declares the catalog and settings services it needs — and nothing else: `config` is the entry value the marker is read from, and injecting it would leave the plugin pending forever',
+)
+assert.equal(typeof entry.Config, 'function', 'the entry declares a Config schema, which is what makes its own row a writable settings namespace')
+
+// --- the row config, which is also the reclaim marker ----------------------
+//
+// The one-shot cleanup writes `residualInputsReclaimed` into this plugin's own
+// row config, so two properties are load-bearing and are asserted here: the
+// field exists in the schema (an undeclared path is refused by the settings
+// seam), and it is VOLATILE (only schema-declared volatile fields survive a
+// settings write). Losing either turns the cleanup into a permanently re-armed
+// deletion, which is the one failure mode this plugin must not have.
+const configSchema = entry.Config.toJSON()
+const configDict = configSchema.refs[configSchema.uid]?.dict ?? {}
+const configFieldNames = Object.keys(configDict)
+assert.equal(configFieldNames.length, 1, `the marker schema carries exactly one field, saw ${configFieldNames.join(', ')}`)
+assert.equal(
+  configFieldNames[0],
+  'residualInputsReclaimed',
+  'the marker field is the one the reclaim reads and writes',
+)
+assert.equal(
+  configSchema.refs[configDict[configFieldNames[0]]]?.meta?.volatile,
+  true,
+  'the marker must be volatile: a settings write keeps nothing else',
 )
 
 // Every module must import cleanly: a broken sibling would activate a plugin
@@ -110,5 +154,15 @@ const rowName = readScalar('name')
 assert.equal(rowName, manifest.name, 'the row name must be the package name so the Loader resolves it')
 assert.equal(rowId, 'custom-reasoning-effort', 'the row id is the plugin id this package publishes')
 assert.equal(rowId, entry.name, 'the row id must equal the name the host half exports')
+
+// The row must carry a config block, because a Loader entry with no `config`
+// has no settings namespace at all: the reclaim marker would have nowhere to be
+// written, and the cleanup would re-arm on every boot. An empty mapping is what
+// this file ships; the first write adds the marker field to it.
+assert.match(
+  patchText.split('\n').map((line) => line.replace(/#.*$/, '')).join('\n'),
+  /^\s{6}config:\s*\{\}\s*$/m,
+  'the row must declare an (empty) config block so the marker has a namespace',
+)
 
 console.log(`MOUNT CHECK: ALL PASS (${rootPath}, ${modules.length} lib module(s), row id=${rowId}, name=${rowName})`)

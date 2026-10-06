@@ -20,8 +20,18 @@
 #
 # The plugin publishes no service (it only normalizes the persisted settings
 # the `llm-pi-ai` adapter already reads), so it sits loose in the host root
-# realm — no `isolate` realm and no `config:` block are needed here.
+# realm — no `isolate` realm is needed here.
+#
+# The `config` block is the plugin's own marker slot, and it is deliberately
+# empty: `residualInputsReclaimed` is written into it, on first run, by the
+# one-shot cleanup of the `input` lists the 0.2.x releases of this plugin left
+# in the profile's `llm-pi-ai` section. Keeping the block here is what makes the
+# row configurable — a Loader entry with no `config` has no settings namespace
+# to write to — and keeping its one field volatile is what lets the cleanup
+# persist through the settings seam. Deleting the field by hand re-runs the
+# cleanup once on the next start; see the README's upgrade section.
 
 - insert:
     - id: custom-reasoning-effort
       name: dsh-custom-reasoning-effort
+      config: {}

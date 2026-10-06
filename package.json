@@ -1,7 +1,7 @@
 {
   "name": "dsh-custom-reasoning-effort",
-  "description": "Backfill per-model capability metadata (reasoning efforts and input modalities) for custom DSH LLM provider routes",
-  "version": "0.2.0",
+  "description": "Backfill per-model reasoning efforts for custom DSH LLM provider routes",
+  "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -14,6 +14,7 @@
   "homepage": "https://github.com/Pheobe-Southwood/dsh-custom-reasoning-effort#readme",
   "keywords": ["deepseek-harness", "dsh", "llm", "reasoning-effort", "settings", "cordis"],
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "dependencies": { "@deepseek-ai/schemastery": "~3.18.4" },
   "peerDependencies": { "@deepseek-ai/cordis": "^4.0.2" },
   "license": "MIT",
   "files": ["cordis.patch.yml", "lib", "README.md", "CONTEXT.md", "docs", "LICENSE"],
@@ -24,9 +25,9 @@
     "test": "npm run test:host && npm run test:mount",
     "test:pack": "npm pack --dry-run",
     "check": "npm run lint && npm test && npm run test:pack",
-    "prepublishOnly": "npm run check"
-  },
+    "prepublishOnly": "npm run check"  },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4",
     "@eslint/js": "10.0.1",
     "eslint": "10.10.0",
     "globals": "17.12.0"

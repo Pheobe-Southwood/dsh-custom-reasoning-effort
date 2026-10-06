@@ -1,7 +1,17 @@
 # 0002. Backfill the per-model `input` list for custom-provider routes
 
 Date: 2026-09-20
-Status: accepted
+Status: superseded by [ADR-0003](0003-hand-input-modalities-to-the-settings-page.md)
+
+> **Superseded.** The decision below was correct for the harness it was written
+> against: no shipped surface wrote the per-model `input` field, so the only way
+> to admit images on a custom route was for this plugin to declare them. DSH
+> v0.2.0's Models settings page now renders a per-model 输入类型 field and writes
+> the same field, which both removes the need and gives the user the per-model
+> control this ADR listed as missing. ADR-0003 records the withdrawal, the
+> one-shot cleanup of the values this decision wrote, and why the plugin keeps
+> its `false`-only opt-out for `reasoningEfforts` but none for `input`. The body
+> is unchanged and remains the record of why the backfill existed.
 
 ## Context
 
