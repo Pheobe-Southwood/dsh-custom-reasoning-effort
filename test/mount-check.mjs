@@ -1,29 +1,38 @@
 /**
- * Bundle-wiring check: proves this package mounts itself.
+ * Bundle-wiring check: proves this package mounts both of its components.
  *
- * Two parity rules keep the mount honest, and both are asserted here:
+ * Parity rules keep the mount honest, and all of them are asserted here:
  *
  *   - the package declares `dsh.bundle.patch`, and `files` ships that patch, so
- *     an npm publish cannot drop the only mount row;
- *   - the patch's row `name` is this package's name, and its `id` equals the
- *     `name` the host half exports, so the row and the plugin are recognizably
- *     the same thing.
+ *     an npm publish cannot drop the mount rows;
+ *   - each row's `name` is the name of the package that ships its code, and its
+ *     `id` equals the `name` that host half exports, so the row and the plugin
+ *     are recognizably the same thing;
+ *   - the second component's row resolves through THIS package: its name is not
+ *     a subpath (a subpath is not a package to DSH, so the panel would get no
+ *     metadata), the sub-package is shipped by `files`, and the reference that
+ *     puts it into the runtime resolution is a peer — never a `dependencies`
+ *     entry, which pnpm resolves against the profile directory and fails on.
+ *     That last invariant is what `test/packaging.test.mjs` proves on a real
+ *     `npm pack` artifact; here it is pinned against silent edits.
  *
  * The patch is parsed by a shape-specific reader rather than a YAML dependency:
- * this package deliberately has no runtime dependencies at all, and the file's
- * shape is one `insert:` list of `id`/`name` scalars (see the file's own
- * comments).
+ * this package deliberately has no runtime dependencies beyond the harness's own
+ * schema library (see below), and the file's shape is one `insert:` list of
+ * `id`/`name` scalars (see the file's own comments).
  *
  * Run with `npm run test:mount`.
  */
 import assert from 'node:assert/strict'
 import { readdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
+import { patchRows } from './cordis-patch.mjs'
 
 const root = new URL('../', import.meta.url)
 const rootPath = fileURLToPath(root)
 
 const manifest = JSON.parse(await readFile(new URL('package.json', root), 'utf8'))
+const subpackage = JSON.parse(await readFile(new URL('effort-memory/package.json', root), 'utf8'))
 
 // --- entry points -----------------------------------------------------------
 
@@ -66,6 +75,36 @@ assert.equal(
   'the schema library is pinned to the harness-compatible line, so a drift can only come from an explicit edit',
 )
 
+// --- how the sub-package reaches the runtime resolution ---------------------
+//
+// Three shapes were tried and two of them are install failures, so both are
+// pinned as regressions here:
+//   - `dependencies: { "dsh-effort-memory": "file:./effort-memory" }` makes pnpm
+//     resolve that relative path against the PROFILE directory, where nothing
+//     named effort-memory/ exists: the whole install dies;
+//   - `bundledDependencies` is recorded as lockfile metadata only, so the entry
+//     never joins the dependency graph and nobody installs it;
+//   - the peer declaration is what makes DSH's dependencyClosure walk the edge
+//     (it reads `dependencies` + `peerDependencies`). Without it the link can
+//     exist inside the package and the row still fails to import.
+assert.equal(
+  manifest.peerDependencies?.['dsh-effort-memory'],
+  'file:./effort-memory',
+  'the sub-package must be declared as a peer so the runtime resolution walks the edge',
+)
+assert.equal(
+  manifest.dependencies?.['dsh-effort-memory'],
+  undefined,
+  'a `file:` entry in dependencies is resolved against the profile and fails the install',
+)
+assert.equal(manifest.bundledDependencies, undefined, 'bundledDependencies never delivers a resolvable package')
+assert.equal(manifest.optionalDependencies, undefined, 'optionalDependencies silently drops the `file:` entry')
+assert.equal(
+  manifest.scripts?.postinstall,
+  'node scripts/link-effort-memory-package.mjs',
+  'the postinstall inside the installed package is what creates the link',
+)
+
 // --- the bundle declaration and the file it points at -----------------------
 
 const declaredPatch = manifest.dsh?.bundle?.patch
@@ -74,6 +113,12 @@ assert.ok(
   manifest.files?.includes(declaredPatch.replace(/^\.\//, '')),
   `package.json files must ship ${declaredPatch}: a publish would otherwise drop the only mount row`,
 )
+for (const shipped of ['effort-memory', 'scripts']) {
+  assert.ok(
+    manifest.files?.includes(shipped),
+    `package.json files must ship ${shipped}: without it the sub-package (or the postinstall that links it) never reaches the install`,
+  )
+}
 
 // --- the entry module and its exports --------------------------------------
 
@@ -111,7 +156,7 @@ assert.equal(
 )
 
 // Every module must import cleanly: a broken sibling would activate a plugin
-// whose normalizer never arrives.
+// whose normalizer never arrives — or a memory whose rules never load.
 const libEntries = await readdir(new URL('lib/', root), { withFileTypes: true })
 const modules = libEntries.filter((item) => item.isFile() && item.name.endsWith('.js')).map((item) => item.name)
 assert.ok(modules.length >= 1, `expected the lib modules to be present, saw ${modules.join(', ')}`)
@@ -119,14 +164,39 @@ for (const module of modules) {
   const loaded = await import(new URL(`lib/${module}`, root))
   assert.ok(loaded !== null && typeof loaded === 'object', `lib/${module} must import cleanly`)
 }
+const memoryEntries = await readdir(new URL('effort-memory/', root), { withFileTypes: true })
+const memoryModules = memoryEntries.filter((item) => item.isFile() && item.name.endsWith('.js')).map((item) => item.name)
+assert.ok(memoryModules.length >= 1, `expected the sub-package modules to be present, saw ${memoryModules.join(', ')}`)
+for (const module of memoryModules) {
+  const loaded = await import(new URL(`effort-memory/${module}`, root))
+  assert.ok(loaded !== null && typeof loaded === 'object', `effort-memory/${module} must import cleanly`)
+}
 
-// --- the patch: exactly one insert row, with matching names -----------------
+// --- the patch: one insert, two rows, each matching its own package ---------
 
 const patchText = await readFile(new URL('cordis.patch.yml', root), 'utf8')
+const stripped = patchText.split('\n').map((line) => line.replace(/#.*$/, '')).join('\n')
 
-const topLevelEntries = patchText
+const rows = patchRows(patchText)
+assert.deepEqual(
+  rows,
+  [
+    { id: 'custom-reasoning-effort', name: manifest.name },
+    { id: 'effort-memory', name: subpackage.name },
+  ],
+  'the patch inserts the normalizer and the memory, each named after the package that ships it',
+)
+// Row ids are what the plugin panel writes `disabled` overrides against, so
+// they must stay unique and stable — the memory's id is the one the standalone
+// dsh-effort-memory bundle used, which is also why a profile that lists both
+// cannot boot (a repeated entry id is a Loader failure).
+assert.equal(new Set(rows.map((row) => row.id)).size, rows.length, 'row ids must be unique')
+for (const row of rows) {
+  assert.ok(!row.name.includes('/'), `${row.name} must be a bare package name: a subpath specifier resolves to no package, so the panel gets no metadata for the row`)
+}
+
+const topLevelEntries = stripped
   .split('\n')
-  .map((line) => line.replace(/#.*$/, ''))
   .filter((line) => /^-\s/.test(line) || /^-\s*$/.test(line))
 assert.equal(
   topLevelEntries.length,
@@ -135,34 +205,20 @@ assert.equal(
 )
 assert.match(topLevelEntries[0], /^-\s*insert:\s*$/, 'the only top-level entry is an insert')
 
-const insertedRows = patchText
-  .split('\n')
-  .map((line) => line.replace(/#.*$/, ''))
-  .filter((line) => /^\s{4}-\s/.test(line))
-assert.equal(insertedRows.length, 1, `the insert carries exactly one row, saw ${insertedRows.length}`)
-
-const readScalar = (key) => {
-  // A row such as `- id: custom-reasoning-effort` carries its key after a
-  // sequence dash, so the dash is part of the scalar line rather than an
-  // indentation.
-  const match = patchText.match(new RegExp(`^\\s*(?:-\\s+)?${key}:\\s*(.+?)\\s*$`, 'm'))
-  return match === null ? undefined : match[1].replace(/^['"]|['"]$/g, '')
-}
-
-const rowId = readScalar('id')
-const rowName = readScalar('name')
-assert.equal(rowName, manifest.name, 'the row name must be the package name so the Loader resolves it')
-assert.equal(rowId, 'custom-reasoning-effort', 'the row id is the plugin id this package publishes')
-assert.equal(rowId, entry.name, 'the row id must equal the name the host half exports')
-
-// The row must carry a config block, because a Loader entry with no `config`
-// has no settings namespace at all: the reclaim marker would have nowhere to be
-// written, and the cleanup would re-arm on every boot. An empty mapping is what
-// this file ships; the first write adds the marker field to it.
-assert.match(
-  patchText.split('\n').map((line) => line.replace(/#.*$/, '')).join('\n'),
-  /^\s{6}config:\s*\{\}\s*$/m,
-  'the row must declare an (empty) config block so the marker has a namespace',
+const insertedRows = stripped.split('\n').filter((line) => /^\s{4}-\s/.test(line))
+assert.equal(insertedRows.length, rows.length, `the insert carries exactly one row per component, saw ${insertedRows.length}`)
+assert.equal(
+  stripped.match(/^\s{6}config:\s*\{\}\s*$/gm)?.length,
+  1,
+  'exactly one row carries a config block: only the normalizer keeps a marker there, and an entry with no config has no namespace to write it to',
 )
 
-console.log(`MOUNT CHECK: ALL PASS (${rootPath}, ${modules.length} lib module(s), row id=${rowId}, name=${rowName})`)
+// The sub-package's own half has to be mountable by that row.
+const memory = await import(new URL('effort-memory/index.js', root))
+assert.equal(memory.name, 'effort-memory', 'the memory host half exports the row id')
+assert.equal(typeof memory.apply, 'function', 'the memory host half exports apply')
+assert.deepEqual(memory.inject, ['llm', 'sessionController'], 'the memory declares only the two services it cannot run without')
+assert.equal(memory.default, undefined, 'no default export: the Loader mounts the named shape')
+assert.equal(subpackage.version, manifest.version, 'the sub-package version tracks the root version, so a release cannot ship a stale one')
+
+console.log(`MOUNT CHECK: ALL PASS (${rootPath}, ${modules.length + memoryModules.length} module(s), rows=${rows.map((row) => row.id).join('+')})`)
