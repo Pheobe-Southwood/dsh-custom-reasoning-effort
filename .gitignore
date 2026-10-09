@@ -2,3 +2,7 @@ node_modules/
 package-lock.json
 *.log
 .DS_Store
+# The packaging test builds a real `npm pack` artifact in a temp directory
+# inside the repo (test/packaging.test.mjs) and removes it afterwards; it stays
+# listed so a crashed run cannot leave the workspace dirty.
+.test-tmp/
