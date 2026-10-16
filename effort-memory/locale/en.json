@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Reasoning effort memory",
+    "description": "Remembers the reasoning effort last in effect on each (provider, model) route and restores it when a session switches back to that model."
+  }
+}

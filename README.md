@@ -1,15 +1,30 @@
 # dsh-custom-reasoning-effort
 
+A reasoning-effort toolkit for DeepSeek Harness (dsh): one package, two
+independently switchable, host-only components.
+
+| Component | What it does | Without it |
+|---|---|---|
+| `custom-reasoning-effort` | Backfills the per-model `reasoningEfforts` of custom-provider routes, so the composer's official 推理等级 picker appears | A model added through 添加自定义提供方 offers no levels at all |
+| `effort-memory` | Remembers the level each `(provider, model)` route was last left on, and re-issues it when a session switches back to that model | Every model switch lands on the new model's default, and the level you left behind is not restored |
+
+Neither component ships a client half, a slot or any UI, neither registers a
+service, and neither calls an LLM. They are two Loader rows of one bundle, so the
+plugin panel switches them separately — see
+[part two](#part-two--the-effort-memory) for the `effort-memory` row, which is an
+in-package sub-package delivered with this package and never installed on its own.
+
+## Part one — the settings normalizer
+
 Backfill the per-model reasoning-effort metadata of custom DeepSeek Harness
 (dsh) LLM provider routes: the levels the composer's official 推理等级 picker
 needs. A model added through 添加自定义提供方 then behaves like the same model
 added through 添加提供方.
 
-The plugin is a host-side settings normalizer: it writes the per-model
-`reasoningEfforts` field the `llm-pi-ai` schema already accepts, and lets the
-shipped pipeline — settings → model catalog → picker → `reasoning_effort` on the
-wire — do the rest. It ships **no client half and no custom UI**, and it never
-calls an LLM itself.
+The normalizer writes the per-model `reasoningEfforts` field the `llm-pi-ai`
+schema already accepts, and lets the shipped pipeline — settings → model catalog
+→ picker → `reasoning_effort` on the wire — do the rest. It ships **no client
+half and no custom UI**, and it never calls an LLM itself.
 
 Input modalities are deliberately **not** this plugin's business: since dsh
 v0.2.0 the Models settings page renders a 输入类型 field (文本 / 图片) on every
@@ -208,10 +223,23 @@ bundle's patch layer, and live patch reload re-reads the profile and home patch
 files over that same boot snapshot — so a bundle installed afterwards joins the
 tree on the next start.
 
-There is no second step: this package declares `dsh.bundle.patch` in
-`package.json`, so the dsh CLI's reconcile step appends it to the profile's
-`dsh.profile.bundles`, and the package's own `cordis.patch.yml` contributes the
-plugin row.
+The bundle list itself needs no second step: this package declares
+`dsh.bundle.patch` in `package.json`, so the dsh CLI's reconcile step appends it
+to the profile's `dsh.profile.bundles`, and the package's own `cordis.patch.yml`
+contributes **both** plugin rows.
+
+The `effort-memory` row does need one approval. Its code is the in-package
+sub-package `effort-memory/`, and the link that makes its package name resolvable
+is created by this package's `postinstall`
+(`scripts/link-effort-memory-package.mjs`). pnpm 11 blocks dependency build scripts
+by default, so on a pnpm-managed profile the first `add` ends in a build-blocked
+failure (`ERR_PNPM_IGNORED_BUILDS`; the plugin panel reports it with an
+allow-and-retry action). Approve the script — the panel's **allow these scripts and
+retry**, or an `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — and
+re-run the same `add` command: the link is created on that run and follows the
+profile from then on. Skipping it costs only the memory, never the normalizer: the
+memory's row is mounted as optional and stays at **Not running**, and the boot
+audit names that row alone.
 
 ### Other install shapes
 
@@ -223,16 +251,17 @@ checkout, or a packed tarball:
 dsh plugin --profile web add github:Pheobe-Southwood/dsh-custom-reasoning-effort
 dsh plugin --profile web add git+https://github.com/Pheobe-Southwood/dsh-custom-reasoning-effort.git
 dsh plugin --profile web add link:/path/to/dsh-custom-reasoning-effort
-npm pack && dsh plugin --profile web add ./dsh-custom-reasoning-effort-0.3.0.tgz
+npm pack && dsh plugin --profile web add ./dsh-custom-reasoning-effort-0.4.0.tgz
 ```
 
 `dsh plugin` initializes a profile that does not exist yet, runs pnpm inside the
 profile directory (so pnpm must be on `PATH`), then reconciles the bundle list
 against what is actually installed: a dependency declaring `dsh.bundle` joins
 `dsh.profile.bundles`, and one that does not is installed with a warning and
-never becomes a layer. This package ships built `lib/` and declares no `prepare`
-script, so no install-time build is involved; a git-hosted plugin that does
-build on install needs its key under `allowBuilds` in the profile's
+never becomes a layer. This package ships built `lib/`, so no install-time *build*
+is involved; its one `postinstall` only creates the sub-package link described
+above, which is why approving it is the whole install-time step. A git-hosted
+plugin that compiles on install needs its key under `allowBuilds` in the profile's
 `pnpm-workspace.yaml` before the command can succeed.
 
 Uninstall is symmetric — reconcile also drops the bundle from
@@ -242,18 +271,31 @@ Uninstall is symmetric — reconcile also drops the bundle from
 dsh plugin --profile web remove dsh-custom-reasoning-effort
 ```
 
-The fields it filled stay in the settings document, and so does the marker on
-its row if the cleanup already ran: the filled levels are schema-legal values in
-the adapter's own settings section, so the file stays valid and the picker keeps
-working. That residue is an accepted consequence — see the ADRs below — and the
-per-model opt-out below is how a model leaves the picker for good.
+**Coming from the standalone `dsh-effort-memory` bundle? Remove it first.** Both
+bundles contribute a Loader row with the id `effort-memory`, and the Loader rejects
+a repeated entry id, so a profile that lists both cannot boot:
 
-**Do not hand-edit the profile's `cordis.patch.yml`** — the package already
-ships that row, and a second copy of the same row is not a harmless duplicate:
-the Loader rejects a repeated entry id and the next boot fails loudly with
+```bash
+dsh plugin --profile web remove dsh-effort-memory
+dsh plugin --profile web add github:Pheobe-Southwood/dsh-custom-reasoning-effort
+```
+
+Nothing remembered is lost in the move: the levels live in the storage domain
+`effort_memory`, which the sub-package keeps unchanged.
+
+The fields the normalizer filled stay in the settings document, and so does the
+marker on its row if the cleanup already ran: the filled levels are schema-legal
+values in the adapter's own settings section, so the file stays valid and the
+picker keeps working. That residue is an accepted consequence — see the ADRs — and
+the per-model opt-out below is how a model leaves the picker for good.
+
+**Do not hand-edit the profile's `cordis.patch.yml`** — the package already ships
+both rows, and a second copy of either is not a harmless duplicate: the Loader
+rejects a repeated entry id and the next boot fails loudly with
 
 ```text
 duplicate loader entry id: custom-reasoning-effort
+duplicate loader entry id: effort-memory
 ```
 
 ## Opting a model out
@@ -281,6 +323,128 @@ over-offers is opted out model by model rather than pinned to a shorter list.
 Input types have no such sentinel and need none — the Models page's 输入类型
 checkboxes are the declaration, and this plugin does not touch the field.
 
+## Part two — the effort memory
+
+The second component remembers the reasoning effort **last actually in effect** on
+each `(provider, model)` route and restores it when a session switches back to that
+model. It is the in-package sub-package `effort-memory/` (`dsh-effort-memory`),
+mounted by its own Loader row and switchable on its own.
+
+### The problem
+
+The composer's model seat renders the effort from the durable `modelSelection`
+projection. Picking a *different* model sends that model's own `defaultEffort`
+(`dsh-client-ui-model-selection/lib/client.js:427,883`), and the host resolver
+materializes the adapter default when a caller omits an effort
+(`dsh-llm/lib/index.js:2116-2130`). A model switch always lands on the new model's
+default, so the level you had chosen on the model you left is not restored when you
+come back.
+
+### What the memory does
+
+1. The memory key is `(provider, model)`; the value is the effort id that was last
+   in effect on that route.
+2. On a route change `A -> B` it remembers `A`'s effort, and then:
+   - if `B` has a remembered effort **and** `B` currently advertises it, it
+     re-issues exactly one selection through `ctx.sessionController.selectModel(...)`,
+     so the session's durable selection becomes `{ B, that effort }`;
+   - otherwise it does nothing and `B` keeps its own default. A first visit to a
+     never-used model therefore lands on that model's default.
+3. A route change is recognized across a restart too: each session's pre-switch
+   route is seeded from the durable `modelSelection` projection at
+   `session/created` — attach time, while that projection still reflects the stored
+   log alone. Reading the seed from inside the event handler would be vacuous:
+   `stateOf` materializes at the session's current cursor, which by then already
+   includes the event being handled.
+4. A target model that declares no reasoning capability (resolved `reasoning`
+   missing, or `reasoningEfforts: false` in settings) gets no `reasoningEffort` and
+   no error.
+5. A remembered effort the target no longer advertises — for example rewritten by
+   part one — falls back to the model's default silently, with no retry.
+6. Effort-only changes on the model already selected are never touched.
+
+### Design constraints
+
+- **Host half only.** No `client.js`, no slot, no React, no UI.
+- **One lever.** `ctx.sessionController.selectModel` — the same public command
+  interface the GUI calls. The memory never appends session events itself and never
+  rewrites in-memory selection state.
+- **Capability first.** `ctx.llm.resolveModelInfo(provider, model)` is consulted
+  before any re-issue, because `selectModel` throws
+  `UNSUPPORTED_REASONING_EFFORT` for a level the target does not advertise.
+- **Loop-safe.** Only a *route change* can trigger a re-issue, only when the
+  event's effort differs from the remembered one, and the re-issue keeps the same
+  route — so the event it produces cannot re-enter the rule as a change.
+- **Replay-safe.** Constructor seeds (replay, fork, resume) never publish on the
+  `session/event` firehose; a `seq < session.firstLiveSeq` guard is kept as
+  belt-and-braces.
+- **No services, no settings, no retries.** Any failure is logged and skipped;
+  nothing is ever surfaced to the user.
+- **No runtime dependencies at all.** The storage-domain declaration is inlined —
+  `defineDomain`/`domainTable` are identity wrappers and the runtime only calls
+  `valueSchema.parse(raw)` — and the component imports nothing but its own sibling
+  module. That is also what lets it be delivered as a plain directory inside this
+  package.
+
+### Persistence
+
+- Domain `effort_memory`, table `efforts`, key `JSON.stringify([provider, model])`,
+  record `{ reasoningEffort }`.
+- The domain name must match `UNIT_NAME_RE = /^[a-z][a-z0-9_]*$/`, which forbids
+  the hyphen — hence the domain is `effort_memory` while the package, the row id
+  and the exported plugin name all stay `effort-memory`.
+- With the base storage stack mounted, the `single`-layout document lands at
+  `$DSH_HOME/storages/effort_memory.json` and survives restarts.
+- Without `ctx.storageDomain`, memory degrades to a process-local `Map` (one
+  warning is logged at apply time) and is lost on restart.
+- Upgrading from the standalone `dsh-effort-memory` bundle keeps this state: the
+  domain name and the file it lands in are the sub-package's and are unchanged.
+
+### How the memory is delivered
+
+The row's `name` has to resolve to a *package* from this package's own directory,
+because that is where DSH anchors the lookup (`packageDirFromAnchor` in
+`@deepseek-ai/dsh-app-boot` probes the require resolution paths of the declaring
+package's `package.json`). Three delivery shapes do not survive an install, and all
+three are pinned as regressions by `test/mount-check.mjs`:
+
+- a `node_modules/dsh-effort-memory` link committed to the repository — pnpm drops
+  a repository's `node_modules/**` when it packs a git-hosted package;
+- `bundledDependencies` — recorded as lockfile metadata and kept out of the
+  dependency graph, so nothing installs the name;
+- `"dsh-effort-memory": "file:./effort-memory"` in `dependencies` — pnpm resolves a
+  `file:` spec against the *profile* directory, where no `effort-memory/` exists,
+  and the whole install fails with `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`.
+
+So the sub-package is delivered from inside this package:
+
+| Piece | Role |
+|---|---|
+| `files: [… "effort-memory", "scripts" …]` | ships the sub-package directory and the link script in the artifact |
+| `peerDependencies: { "dsh-effort-memory": "file:./effort-memory" }` | pnpm installs no peer, but DSH's dependency closure walks `dependencies` **and** `peerDependencies`: without this edge the link can be present and the row still fails to import |
+| `scripts/link-effort-memory-package.mjs` (the root `postinstall`) | creates `<package root>/node_modules/dsh-effort-memory -> <package root>/effort-memory` inside the installed package. It falls back to a copy, and then to a warning, but never fails the install |
+
+`test/packaging.test.mjs` proves this on a real `npm pack` artifact: it extracts
+the tarball, asserts the row's name does **not** resolve before that postinstall
+runs, and that it resolves to the in-package sub-package afterwards.
+
+### Known limitations
+
+1. One settings write per switch is performed by the public `selectModel` path
+   itself (`agentDefaultModel.saveSelection` →
+   `settings.replace('agent-default-model', …)`). The memory adds no settings
+   namespace and no settings write of its own.
+2. Memory is global per `(provider, model)` — shared by every session and
+   workspace.
+3. The memory acts on every live session whose route changes, subagent sessions
+   included.
+4. Without `ctx.sessionProjections` there is no attach-time seed, so a session's
+   first switch after a restart only establishes a baseline and is not restored;
+   every later switch in the same process is.
+5. A stale remembered level is kept (harmless): if a model's effort table later
+   regains that level, it is restored again.
+6. Single-process visibility only; `domain/changed` does not cross processes.
+
 ## Development
 
 ```bash
@@ -290,11 +454,38 @@ npm test           # unit tests and the bundle mount check
 npm run test:mount # the mount check alone
 ```
 
+`npm install` also runs this package's own `postinstall`, so the sub-package link
+exists in the checkout. `npm pack` runs neither `postinstall` nor `prepare` here
+(npm's pack lifecycle is `prepack` → `prepare` → `postpack`), which is why the
+packaging test reproduces the link itself inside the extracted artifact.
+
+In a confined sandbox `npm run test:host` (`node --test test/*.test.mjs`) cannot
+run: the runner starts one child process per file with piped stdio, which such a
+sandbox refuses with `spawn EPERM`. The same suites run in-process:
+
+```bash
+node --test --test-isolation=none "test/*.test.mjs"
+```
+
+| Path | Role |
+|---|---|
+| `lib/` | Part one's host half (`index.js`) and its pure planning rules (`normalize.js`) |
+| `effort-memory/` | The sub-package `dsh-effort-memory`: `index.js` (event half), `decide.js` (pure rules), `locale/` (the panel row's title and description) |
+| `cordis.patch.yml` | Both Loader rows — the only place either is declared |
+| `scripts/link-effort-memory-package.mjs` | The root `postinstall` that links the sub-package into this package's `node_modules` |
+| `test/` | Unit suites, the bundle mount check and the packaging test |
+| `docs/adr/` | The decisions, including [ADR-0004](docs/adr/0004-ship-the-effort-memory-as-an-in-package-sub-package.md) for the delivery shape |
+
 ## License
 
-MIT — see `LICENSE`. The reasoning-effort semantics this plugin depends on are
-the harness's own, documented by the ADRs in
+MIT — see `LICENSE`. The `effort-memory` component was merged in from the
+standalone `dsh-effort-memory` bundle (`github:cup113/dsh-effort-memory`, MIT,
+© 2026 Jason Li) and keeps that provenance; its code is unchanged apart from the
+packaging and the comments that documented the old delivery.
+
+The reasoning-effort semantics this package depends on are the harness's own,
+documented by the ADRs in
 `docs/adr/0001-settings-normalization-for-custom-provider-reasoning-effort.md`,
-`docs/adr/0002-input-modality-backfill-for-custom-provider-routes.md` (superseded)
-and
-`docs/adr/0003-hand-input-modalities-to-the-settings-page.md`.
+`docs/adr/0002-input-modality-backfill-for-custom-provider-routes.md` (superseded),
+`docs/adr/0003-hand-input-modalities-to-the-settings-page.md`
+and [ADR-0004](docs/adr/0004-ship-the-effort-memory-as-an-in-package-sub-package.md).
