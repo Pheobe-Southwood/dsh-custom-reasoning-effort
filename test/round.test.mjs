@@ -1,37 +1,81 @@
 /**
- * Integration tests for the plugin half: `apply` wired to a stateful stub.
+ * Integration tests for the plugin half: the real pass, mounted on a stateful
+ * stub context.
  *
- * `normalizer.test.mjs` and `reclaim.test.mjs` judge planning; this file judges
- * the wiring planning cannot reach — which round runs when, which namespace each
- * write goes to, and what the marker gate means for the deletion. The stub is
- * deliberately thin and hand-written (this package ships no test framework and no
- * dependency on the harness), and it is STATEFUL on purpose: `mutate` applies the
- * ops to the document it serves, so a second round reads what the first one wrote.
- * That is what makes the debounce loop's loop-breaker testable — with a stub that
- * kept answering from the fixture, "the second pass is a no-op" would be a
- * statement about the fixture, not about the plugin. The one thing it does not
- * model is the harness's own schema validation, which has no bearing on the paths
- * this plugin writes.
+ * `normalizer.test.mjs` and `modelsdev.test.mjs` judge the pieces; this file
+ * judges the wiring they cannot reach — which trigger runs a pass, what a
+ * refused or failing write does, and what happens to the plugin AFTER a failure.
+ * The stub is deliberately thin and hand-written (this package ships no test
+ * framework and no dependency on the harness) and it is STATEFUL on purpose:
+ * `mutate` applies the ops to the document it serves, so a second pass reads
+ * what the first one wrote. That is what makes the settle test real — with a
+ * stub that kept answering from the fixture, "the second pass is a no-op" would
+ * be a statement about the fixture, not about the plugin.
  *
- * Three things here are load-bearing and easy to break:
- *   - the removal is written to the `llm-pi-ai` namespace and the marker to this
- *     plugin's own row: putting them in one write would route one of them to the
- *     wrong namespace, which is how the marker silently became the thing that was
- *     deleting;
- *   - the marker is written only after a successful removal, so a refused
- *     removal can never leave a marker that claims it happened;
- *   - once the marker is set, no later round may delete an `input` list — that is
- *     the promise the whole one-shot design exists to keep.
+ * The cases that matter most, because each of them is why this file was
+ * rewritten:
+ *
+ *   - A REFUSED TIMER MUST NOT LATCH. The previous release armed its debounce
+ *     through `ctx.effect` and, on a refusal, set a `disposed` flag for the life
+ *     of the instance. The harness hot-reloads the profile patch on every
+ *     settings write, so one refusal in that window silenced the plugin forever
+ *     while its row still read `active` — which is exactly how `gemini-4-argon`
+ *     ended up with no picker while its six older siblings kept theirs. The
+ *     regression is pinned below: after a refused arm, the plugin still runs.
+ *   - THERE IS A THIRD TRIGGER. Events can be missed; the reconcile tick cannot
+ *     be, so a pass happens even with no signal at all.
+ *   - A FAILURE IS VISIBLE AND DEDUPLICATED. This deployment registers no logger
+ *     exporter, so failures also reach the console; and a permanent condition is
+ *     reported once, not once per tick.
+ *   - THE PLUGIN WRITES TO `llm-pi-ai` AND NOWHERE ELSE. It declares no `Config`
+ *     and keeps no marker, which is what an uninstall leaves nothing behind.
  *
  * Run with `npm run test:host`.
  */
 import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
 import test from 'node:test'
-import { name as PLUGIN_NAME, apply } from '../lib/index.js'
-import { DEFAULT_REASONING_EFFORTS, RESIDUAL_INPUT_VERSION } from '../lib/normalize.js'
+import { apply, createNormalizer, name as PLUGIN_NAME } from '../lib/index.js'
+import { DEFAULT_REASONING_EFFORTS } from '../lib/normalize.js'
 
-// --- stubs ------------------------------------------------------------------
+// --- fixtures ---------------------------------------------------------------
+
+const CUSTOM = 'verify-gateway'
+
+/** The models.dev document every case fetches, unless it says otherwise. */
+const DEV_DOCUMENT = () => ({
+  google: {
+    models: {
+      argon: { id: 'argon', reasoning: true, reasoning_options: [{ type: 'effort', values: ['low', 'medium', 'high'] }] },
+      wide: { id: 'wide', reasoning: true, reasoning_options: [{ type: 'effort', values: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] }] },
+      'not-reasoning': { id: 'not-reasoning', reasoning: false },
+    },
+  },
+  requesty: {
+    models: {
+      argon: { id: 'argon', reasoning: true, reasoning_options: [{ type: 'effort', values: ['none', 'low', 'medium', 'high', 'max'] }] },
+    },
+  },
+})
+
+const jsonResponse = (body) => new Response(JSON.stringify(body), { status: 200 })
+
+/** A transport stub that answers each call with the next queued entry. */
+const transport = (answers) => {
+  const calls = []
+  const fetchImpl = () => {
+    calls.push(calls.length)
+    const next = answers.shift()
+    if (next === undefined) return Promise.reject(new Error('no queued answer'))
+    return typeof next === 'function' ? next() : Promise.resolve(next)
+  }
+  return { fetchImpl, calls }
+}
+
+/** The persisted layer holding the given models on the custom route. */
+const userLayer = (models) => ({
+  providers: { [CUSTOM]: { api: 'openai-completions', baseURL: 'https://gateway.example/v1', models } },
+})
 
 /** A shallow-cloned document walk plus the two path ops the plugin emits. */
 const applyOps = (document, ops) => {
@@ -46,69 +90,67 @@ const applyOps = (document, ops) => {
 }
 
 /**
- * One plugin context good enough for `apply`: the services it injects, the three
- * events it listens to, an effect registry and a logger.
+ * One plugin context good enough for `mount`.
  *
- * `settings.describe()` answers the two namespaces the round reads — the
- * adapter's `llm-pi-ai` layer and this plugin's own row, which is where the
- * reclaim marker lives and why both are here — and `settings.mutate()` applies
- * every write to the store behind them, exactly as the harness does.
+ * `effect` is a real registry, because the plugin's own cleanup contract is
+ * under test: it records the disposers, can be told to REFUSE a labelled effect
+ * (which is what a fiber unloading mid-reload does), and its factory runs
+ * immediately, as Cordis runs it.
+ *
+ * @param options - the fixture and the failure switches.
+ * @returns the context and everything a case asserts on.
  */
-const contextFor = ({ user, marker, catalog = {}, catalogRoutes = [], providers = [], refusals = 0 }) => {
+function contextFor({
+  user,
+  catalogRoutes = [],
+  providers = [],
+  conflictOnce = false,
+  permanentError = false,
+  permanentConflict = false,
+  lieOnWrite = false,
+  refuseLabels = {},
+  config,
+} = {}) {
   const mutations = []
   const logs = []
   const listeners = new Map()
-  const state = { user: structuredClone(user), config: marker === undefined ? {} : { residualInputsReclaimed: marker } }
-  let refused = 0
+  const disposers = []
+  const state = { user: structuredClone(user) }
+  const refusals = { conflictOnce, permanentError, permanentConflict }
+  let conflictsLeft = conflictOnce ? 1 : 0
+  let labelRefusals = { ...refuseLabels }
+
   const ctx = {
     get config() {
-      return state.config
+      return config
     },
     settings: {
       describe: () => [{
         ns: 'llm-pi-ai',
-        revision: mutations.filter((entry) => entry.ns === 'llm-pi-ai').length + 1,
+        revision: mutations.length + 1,
         autoGenerate: true,
         applies: 'live',
         schema: {},
         value: state.user,
         user: state.user,
-      }, {
-        ns: PLUGIN_NAME,
-        revision: mutations.filter((entry) => entry.ns === PLUGIN_NAME).length + 1,
-        autoGenerate: true,
-        applies: 'live',
-        schema: {},
-        value: state.config,
-        user: state.config,
       }],
       mutate: async (ns, ops, revision) => {
-        if (refused < refusals) {
-          refused += 1
-          const error = new Error('stub refused the write')
+        if (refusals.permanentError) throw new Error('stub refused the write')
+        if (refusals.permanentConflict || conflictsLeft > 0) {
+          if (conflictsLeft > 0) conflictsLeft -= 1
+          const error = new Error('stub conflict')
           error.code = 'SETTINGS_CONFLICT'
           throw error
         }
         mutations.push({ ns, ops, revision })
-        if (ns === 'llm-pi-ai') state.user = applyOps(state.user, ops)
-        else state.config = applyOps(state.config, ops)
+        if (!lieOnWrite && ns === 'llm-pi-ai') state.user = applyOps(state.user, ops)
       },
     },
     llm: {
-      listConfigurableProviders: () => [...catalogRoutes.map((route) => ({ provider: route, declared: false })), ...providers],
-      listProviders: () => Object.keys(catalog).map((id) => ({ id })),
-      listModels: async (route) => Object.keys(catalog[route] ?? {}).map((id) => ({ id })),
-      resolveModelInfo: async (route, model) => {
-        const facts = catalog[route]?.[model]
-        if (facts === undefined) throw new Error(`no such model: ${route}/${model}`)
-        return {
-          provider: route,
-          id: model,
-          name: model,
-          ...facts.inputModalities === undefined ? {} : { inputModalities: facts.inputModalities },
-          ...facts.reasoning === undefined ? {} : { reasoning: facts.reasoning },
-        }
-      },
+      listConfigurableProviders: () => [
+        ...catalogRoutes.map((route) => ({ provider: route, declared: false })),
+        ...providers,
+      ],
     },
     logger: {
       info: (message) => logs.push({ level: 'info', message }),
@@ -118,269 +160,349 @@ const contextFor = ({ user, marker, catalog = {}, catalogRoutes = [], providers 
       listeners.set(event, listener)
       return () => listeners.delete(event)
     },
-    effect: (factory) => factory(),
+    effect: (factory, label) => {
+      if ((labelRefusals[label] ?? 0) > 0) {
+        labelRefusals[label] -= 1
+        throw new Error('INACTIVE_EFFECT')
+      }
+      const produced = factory()
+      const dispose = () => {
+        const at = disposers.indexOf(dispose)
+        if (at >= 0) disposers.splice(at, 1)
+        if (typeof produced === 'function') produced()
+      }
+      disposers.push(dispose)
+      return dispose
+    },
   }
-  return { ctx, mutations, logs, listeners, state }
+  return {
+    ctx,
+    mutations,
+    logs,
+    listeners,
+    state,
+    /** Every cleanup still registered on the fiber. */
+    liveEffects: () => [...disposers],
+    /** Run every registered cleanup; every case that mounts must call this. */
+    cleanup: () => {
+      for (const dispose of disposers.splice(0).reverse()) dispose()
+    },
+    mutationsFor: (ns = 'llm-pi-ai') => mutations.filter((entry) => entry.ns === ns),
+  }
 }
 
-/** The persisted layer the fixtures below start from: one custom route, two models. */
-const userLayer = () => ({
-  providers: {
-    'verify-gateway': {
-      api: 'openai-completions',
-      baseURL: 'https://gateway.example/v1',
-      models: [
-        { id: 'my-chat', name: 'My Chat', contextWindow: 8192, input: ['text', 'image'] },
-        { id: 'my-narrow-chat', input: ['text'] },
-      ],
-    },
-  },
-})
+/** Mount the plugin with a queued transport. */
+function mountWith(options, normalizerOptions = {}) {
+  const stub = contextFor(options)
+  const answers = options.answers ?? [jsonResponse(DEV_DOCUMENT())]
+  const { fetchImpl, calls } = transport(answers)
+  const normalizer = createNormalizer({ fetchImpl, debounceMs: 15, reconcileMs: 10 ** 9, ...normalizerOptions })
+  normalizer.mount(stub.ctx)
+  return { ...stub, normalizer, calls }
+}
 
-/**
- * The writes one namespace received, in order.
- *
- * Order is the discriminator and it is deterministic: a round reclaims first and
- * fills second, so on an unreclaimed document the first `llm-pi-ai` write is the
- * removal's and the second the fill's. Both look alike — both set a route's whole
- * `models` array — which is exactly why the assertions reach for a position
- * rather than for a shape.
- */
-const writesFor = (mutations, ns) => mutations.filter((entry) => entry.ns === ns)
+/** Wait past the debounce plus slack for the awaited pass. */
+const settle = (ms = 80) => delay(ms)
 
-/** Wait past the plugin's debounce, plus slack for the awaited round. */
-const settle = async () => {
-  await delay(400)
+/** The `models` array of the last committed write. */
+const writtenModels = (mutations) => mutations[mutations.length - 1]?.ops[0].value
+
+/** Capture `console.warn` for the duration of one awaited block. */
+async function capturedWarnings(run) {
+  const original = console.warn
+  const seen = []
+  console.warn = (line) => seen.push(String(line))
+  try {
+    return await run(seen)
+  } finally {
+    console.warn = original
+  }
 }
 
 // --- arming -----------------------------------------------------------------
 
-test('apply arms one round from the first pass, and nothing runs synchronously', () => {
-  const { ctx, logs, mutations } = contextFor({ user: userLayer(), marker: undefined })
-
-  assert.equal(typeof apply, 'function')
-  apply(ctx)
-
-  // The first pass is debounced so plugin rows that apply after this one have
-  // landed before the settings section is read.
-  assert.deepEqual(logs, [])
-  assert.deepEqual(mutations, [])
-})
-
-// --- the reclaim ------------------------------------------------------------
-
-test('a first round removes the leftover list and writes the marker, each to its own namespace', async () => {
-  const { ctx, mutations, state, logs } = contextFor({ user: userLayer(), marker: undefined })
-  apply(ctx)
-  await settle()
-
-  const [removal, fill] = writesFor(mutations, 'llm-pi-ai')
-  assert.ok(removal !== undefined && fill !== undefined, `expected two llm-pi-ai writes, saw ${JSON.stringify(mutations)}`)
-  assert.equal(removal.revision, 1, 'the removal is committed against the revision that was read')
-  assert.equal(fill.revision, 2, 'the fill re-reads after that write, so it guards the newer revision')
-  assert.deepEqual(removal.ops.map((op) => op.path), [['providers', 'verify-gateway', 'models']])
-  // The fallback list is the previous release's own value for an id no catalog
-  // route describes; the narrower list beside it is the user speaking.
-  assert.equal(Object.hasOwn(removal.ops[0].value[0], 'input'), false)
-  assert.deepEqual(removal.ops[0].value[1].input, ['text'])
-
-  const markers = writesFor(mutations, PLUGIN_NAME)
-  assert.equal(markers.length, 1, 'the marker is written once, after the removal')
-  assert.deepEqual(markers[0].ops, [{ op: 'set', path: ['residualInputsReclaimed'], value: RESIDUAL_INPUT_VERSION }])
-  assert.equal(markers[0].revision, undefined, 'the marker carries no revision guard: it is this plugin’s own row')
-
-  // The stub applied both, which is what the next round reads.
-  assert.deepEqual(state.config, { residualInputsReclaimed: RESIDUAL_INPUT_VERSION })
-  assert.equal(Object.hasOwn(state.user.providers['verify-gateway'].models[0], 'input'), false)
-  assert.ok(logs.some((entry) => entry.level === 'info' && entry.message.includes('reclaimed')), 'the cleanup is reported')
-})
-
-test('a refused removal is never followed by a marker', async () => {
-  const { ctx, mutations, logs, state } = contextFor({ user: userLayer(), marker: undefined, refusals: Number.POSITIVE_INFINITY })
-  apply(ctx)
-  await settle()
-
-  assert.deepEqual(mutations, [], 'nothing reaches the seam')
-  assert.deepEqual(state.config, {}, 'the marker must not claim a cleanup that did not happen')
-  assert.ok(logs.some((entry) => entry.level === 'warn' && entry.message.includes('skipped one normalization pass')), `the failure must be visible: ${JSON.stringify(logs)}`)
-})
-
-test('a twin list is removed only where the catalog states it', async () => {
-  const user = {
-    providers: {
-      'verify-gateway': {
-        models: [
-          { id: 'vision-twin', input: ['text', 'image'] },
-          { id: 'text-twin', input: ['text', 'image'] },
-        ],
-      },
-    },
+test('mounting arms a round and writes nothing synchronously', () => {
+  const { ctx, mutations, logs, cleanup } = contextFor({ user: userLayer([{ id: 'argon' }]) })
+  try {
+    apply(ctx)
+    assert.deepEqual(mutations, [])
+    assert.deepEqual(logs, [])
+  } finally {
+    cleanup()
   }
-  const catalog = { openai: { 'vision-twin': { inputModalities: ['text', 'image'] }, 'text-twin': { inputModalities: ['text'] } } }
-  const { ctx, mutations, state } = contextFor({ user, marker: undefined, catalog, catalogRoutes: ['openai'] })
-  apply(ctx)
-  await settle()
-
-  const models = writesFor(mutations, 'llm-pi-ai')[0].ops[0].value
-  assert.equal(Object.hasOwn(models[0], 'input'), false, 'the twin states this list, so it is a leftover')
-  assert.deepEqual(models[1].input, ['text', 'image'], 'this id’s twin states text-only, so the list is the user’s')
-  assert.equal(Object.hasOwn(state.user.providers['verify-gateway'].models[1], 'input'), true)
 })
 
-test('the marker turns the reclaim off, so a later round leaves the field alone', async () => {
-  const user = {
-    providers: {
-      'verify-gateway': {
-        models: [{ id: 'my-chat', input: ['text', 'image'], reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS } }],
-      },
-    },
-  }
-  // A marker at the current revision is what a finished upgrade leaves behind;
-  // the list beside it is then a choice made in the Models page.
-  const { ctx, mutations, logs } = contextFor({ user, marker: RESIDUAL_INPUT_VERSION })
-  apply(ctx)
-  await settle()
-
-  assert.deepEqual(mutations, [], 'nothing to reclaim and nothing to fill, so nothing is written')
-  assert.ok(
-    logs.every((entry) => entry.message.includes('no legacy input declarations') === false),
-    'the cleanup does not even report itself',
-  )
-})
-
-test('an older marker still reclaims, a newer one does not', async () => {
-  const user = { providers: { 'verify-gateway': { models: [{ id: 'my-chat', input: ['text', 'image'] }] } } }
-
-  const old = contextFor({ user, marker: 0 })
-  apply(old.ctx)
-  await settle()
-  assert.equal(Object.hasOwn(writesFor(old.mutations, 'llm-pi-ai')[0].ops[0].value[0], 'input'), false, 'a marker below the revision re-runs the cleanup')
-
-  const fresh = contextFor({ user, marker: RESIDUAL_INPUT_VERSION + 1 })
-  apply(fresh.ctx)
-  await settle()
-  assert.equal(writesFor(fresh.mutations, 'llm-pi-ai').length, 1, 'a newer marker writes the fill and nothing else')
-  assert.equal(Object.hasOwn(fresh.state.user.providers['verify-gateway'].models[0], 'input'), true, 'a newer marker must not delete anything')
-})
-
-test('a clean document still writes the marker, so a route added later is never swept', async () => {
-  const user = { providers: { 'verify-gateway': { models: [{ id: 'my-chat', reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS } }] } } }
-  const { ctx, mutations } = contextFor({ user, marker: undefined })
-  apply(ctx)
-  await settle()
-
-  assert.deepEqual(writesFor(mutations, 'llm-pi-ai'), [], 'the effort value is already the computed one')
-  assert.equal(writesFor(mutations, PLUGIN_NAME)[0].ops[0].value, RESIDUAL_INPUT_VERSION, 'the cleanup is retired even when it had nothing to do')
-})
-
-// --- the capability fill ----------------------------------------------------
-
-test('the fill writes only reasoningEfforts, and only when it differs', async () => {
-  const user = { providers: { 'verify-gateway': { models: [{ id: 'my-chat', name: 'My Chat' }] } } }
-  const { ctx, mutations, state } = contextFor({ user, marker: RESIDUAL_INPUT_VERSION })
-  apply(ctx)
-  await settle()
-
-  const write = writesFor(mutations, 'llm-pi-ai')[0]
-  assert.deepEqual(write.ops[0].value, [{ id: 'my-chat', name: 'My Chat', reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS } }])
-  assert.equal(Object.hasOwn(state.user.providers['verify-gateway'].models[0], 'input'), false, 'no modality list is invented')
-})
-
-test('the fill inherits a twin’s levels and reports where they came from', async () => {
-  const user = { providers: { 'verify-gateway': { models: [{ id: 'gpt-5' }] } } }
-  const catalog = { openai: { 'gpt-5': { inputModalities: ['text', 'image'], reasoning: { efforts: [{ id: 'minimal' }, { id: 'low' }, { id: 'medium' }, { id: 'high' }] } } } }
-  const { ctx, mutations, logs } = contextFor({ user, marker: RESIDUAL_INPUT_VERSION, catalog, catalogRoutes: ['openai'] })
-  apply(ctx)
-  await settle()
-
-  assert.deepEqual(writesFor(mutations, 'llm-pi-ai')[0].ops[0].value[0].reasoningEfforts, {
-    minimal: 'minimal',
-    low: 'low',
-    medium: 'medium',
-    high: 'high',
+test('the first pass waits for the capability source, and the fetch completion writes', async () => {
+  let release
+  const pending = new Promise((resolve) => {
+    release = resolve
   })
-  assert.ok(logs.some((entry) => entry.message.includes('1 inherited')), `the round reports the source: ${JSON.stringify(logs)}`)
-})
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]), answers: [() => pending] })
+  try {
+    await settle(40)
+    assert.deepEqual(stub.mutations, [], 'the document must not be stamped with the standard set while models.dev is still arriving')
+    assert.equal(stub.normalizer.catalog.state().status, 'pending')
 
-// --- settling and failure modes ---------------------------------------------
-
-test('a re-armed round is a no-op once the write has landed', async () => {
-  const { ctx, mutations, listeners } = contextFor({ user: userLayer(), marker: RESIDUAL_INPUT_VERSION })
-  apply(ctx)
-  await settle()
-  const settled = mutations.length
-  assert.ok(settled > 0, 'the first round writes')
-
-  // The adapter re-registered its routes, which is what the plugin's own write
-  // looks like from this side. The stub has applied that write, so the next
-  // round reads the computed values and must produce nothing.
-  listeners.get('llm/adapters-updated')()
-  await settle()
-
-  assert.equal(mutations.length, settled, 'the computed values are already in place, so the loop settles')
-})
-
-test('a settled plugin stays settled across repeated change signals', async () => {
-  const { ctx, mutations, listeners } = contextFor({ user: userLayer(), marker: undefined })
-  apply(ctx)
-  await settle()
-  const settled = mutations.length
-
-  for (let round = 0; round < 3; round += 1) {
-    listeners.get('settings/document-updated')('llm-pi-ai')
+    release(jsonResponse(DEV_DOCUMENT()))
     await settle()
+    const written = writtenModels(stub.mutations)
+    assert.deepEqual(written[0].reasoningEfforts, { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' },
+      'the union of the two providers’ declarations, with off first')
+    assert.equal(stub.mutations.length, 1)
+    assert.equal(stub.mutations[0].ns, 'llm-pi-ai')
+    assert.equal(stub.mutations[0].revision, 1, 'the write is guarded by the revision it read')
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('an id models.dev does not describe takes the standard set', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'unknown-model' }, { id: 'argon' }]) })
+  try {
+    await settle()
+    const written = writtenModels(stub.mutations)
+    assert.deepEqual(written[0].reasoningEfforts, DEFAULT_REASONING_EFFORTS)
+    assert.deepEqual(written[1].reasoningEfforts, { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' })
+    assert.ok(stub.logs.some((entry) => entry.message.includes('1 from models.dev, 1 standard')), `the round reports its sources: ${JSON.stringify(stub.logs)}`)
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('a profile with no custom routes never touches the network', async () => {
+  const stub = mountWith({ user: { providers: { openai: { models: [{ id: 'gpt-5' }] } } }, catalogRoutes: ['openai'] })
+  try {
+    await settle()
+    assert.equal(stub.calls.length, 0)
+    assert.deepEqual(stub.mutations, [])
+  } finally {
+    stub.cleanup()
+  }
+})
+
+// --- the failure the plugin must never repeat -------------------------------
+
+test('a refused timer is reported and does not disable the plugin', async () => {
+  // This is the production failure in miniature: the initial arm is refused
+  // (as it is while the harness reloads the profile patch), and the plugin has
+  // to keep working. The previous release latched here and went silent forever.
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]), refuseLabels: { 'custom-reasoning-effort:round': 1 } })
+  try {
+    await settle()
+    assert.deepEqual(stub.mutations, [], 'the refused arm ran nothing')
+    assert.ok(
+      stub.logs.some((entry) => entry.level === 'warn' && entry.message.includes('could not arm the debounced round')),
+      `the refusal must be reported: ${JSON.stringify(stub.logs)}`,
+    )
+
+    stub.listeners.get('settings/document-updated')('llm-pi-ai')
+    await settle()
+    assert.equal(stub.mutations.length, 1, 'the next signal still arms a round')
+    assert.deepEqual(writtenModels(stub.mutations)[0].reasoningEfforts, { off: null, low: 'low', medium: 'medium', high: 'high', max: 'max' })
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('the reconcile tick runs a pass with no event at all', async () => {
+  // The self-healing trigger: a missed or refused event can strand a model
+  // forever if the only way to run a pass is another event.
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]) }, { debounceMs: 10 ** 9, reconcileMs: 15 })
+  try {
+    await settle(120)
+    assert.equal(stub.mutations.length, 1, 'the tick re-ran the pass and wrote the fill')
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('the reconcile tick stops with the plugin', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]) }, { debounceMs: 10 ** 9, reconcileMs: 15 })
+  await settle(60)
+  const written = stub.mutations.length
+  stub.cleanup()
+  await settle(60)
+  assert.equal(stub.mutations.length, written, 'a disposed plugin writes nothing more')
+})
+
+// --- visible, deduplicated failures ----------------------------------------
+
+test('an unavailable models.dev falls back, warns once, and keeps retrying quietly', async () => {
+  const stub = mountWith({
+    user: userLayer([{ id: 'argon' }]),
+    answers: [new Response('down', { status: 503 })],
+  })
+  try {
+    await capturedWarnings(async (consoleLines) => {
+      await settle()
+      assert.deepEqual(writtenModels(stub.mutations)[0].reasoningEfforts, DEFAULT_REASONING_EFFORTS,
+        'the picker must still appear while the source is unreachable')
+      const warnings = stub.logs.filter((entry) => entry.level === 'warn')
+      assert.equal(warnings.length, 1, `one warning per cause, not one per pass: ${JSON.stringify(stub.logs)}`)
+      assert.match(warnings[0].message, /models\.dev is unavailable \(models\.dev answered 503\)/)
+      assert.ok(consoleLines.some((line) => line.startsWith(`[${PLUGIN_NAME}]`)),
+        'this deployment registers no logger exporter, so a failure must also reach the console')
+
+      stub.listeners.get('settings/document-updated')('llm-pi-ai')
+      await settle()
+      assert.equal(stub.logs.filter((entry) => entry.level === 'warn').length, 1, 'the same cause is not reported again')
+    })
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('a lying seam is caught by the verification pass', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]), lieOnWrite: true })
+  try {
+    await capturedWarnings(async () => {
+      await settle(150)
+      assert.ok(
+        stub.logs.some((entry) => entry.level === 'warn' && entry.message.includes('the write landed but')),
+        `a write that did not land must be visible: ${JSON.stringify(stub.logs)}`,
+      )
+      assert.equal(stub.mutations.length, 1, 'the failed verification is reported, not retried in a loop')
+    })
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('a revision conflict is retried once and a permanent refusal is warned once', async () => {
+  const conflicted = mountWith({ user: userLayer([{ id: 'argon' }]), conflictOnce: true })
+  try {
+    await settle()
+    assert.equal(conflicted.mutations.length, 1, 'the retry re-reads and commits')
+    assert.ok(conflicted.logs.every((entry) => entry.level === 'info'), `a transient conflict is not a warning: ${JSON.stringify(conflicted.logs)}`)
+  } finally {
+    conflicted.cleanup()
   }
 
-  assert.equal(mutations.length, settled, 'a debounced burst per change, each planning nothing')
+  const refused = mountWith({ user: userLayer([{ id: 'argon' }]), permanentError: true })
+  try {
+    await capturedWarnings(async () => {
+      await settle()
+      assert.deepEqual(refused.mutations, [])
+      const warnings = refused.logs.filter((entry) => entry.level === 'warn')
+      assert.equal(warnings.length, 1, 'the permanent refusal is reported once per cause')
+      assert.match(warnings[0].message, /skipped one normalization pass \(stub refused the write\)/)
+
+      refused.listeners.get('llm/adapters-updated')()
+      await settle()
+      assert.equal(refused.logs.filter((entry) => entry.level === 'warn').length, 1, 'a repeat of the same cause stays quiet')
+    })
+  } finally {
+    refused.cleanup()
+  }
 })
 
-test('an unrelated namespace change does not arm the round', async () => {
-  const { ctx, mutations, listeners } = contextFor({ user: userLayer(), marker: RESIDUAL_INPUT_VERSION })
-  apply(ctx)
-  await settle()
-  const settled = mutations.length
+// --- the document rules the pass must respect -------------------------------
 
-  listeners.get('settings/document-updated')('llm-deepseek')
-  await settle()
-
-  assert.equal(mutations.length, settled, 'only this plugin’s namespace is a signal')
+test('an unresolvable route is skipped and still written around', async () => {
+  const user = {
+    providers: {
+      [CUSTOM]: { models: [{ id: 'argon' }] },
+      broken: { models: [{ id: 'argon' }] },
+    },
+  }
+  const stub = mountWith({ user, providers: [{ provider: 'broken', error: 'this route cannot be resolved' }] })
+  try {
+    await settle()
+    assert.deepEqual(stub.mutations.flatMap((entry) => entry.ops.map((op) => op.path[1])), [CUSTOM],
+      'the healthy route commits; the unresolvable one is left for the next pass')
+    assert.ok(stub.logs.some((entry) => entry.level === 'warn' && entry.message.includes('unresolvable custom route(s)')), 'the skip is named')
+  } finally {
+    stub.cleanup()
+  }
 })
 
-test('a revision conflict is retried once, and a permanent refusal is reported', async () => {
-  const conflicted = contextFor({ user: userLayer(), marker: RESIDUAL_INPUT_VERSION, refusals: 1 })
-  apply(conflicted.ctx)
-  await settle()
-  assert.equal(writesFor(conflicted.mutations, 'llm-pi-ai').length, 1, 'the conflict retries and the retry commits')
-  assert.ok(conflicted.logs.every((entry) => entry.level === 'info'), `a transient conflict is not a warning: ${JSON.stringify(conflicted.logs)}`)
-
-  const refused = contextFor({ user: userLayer(), marker: RESIDUAL_INPUT_VERSION, refusals: Number.POSITIVE_INFINITY })
-  apply(refused.ctx)
-  await settle()
-  assert.deepEqual(refused.mutations, [])
-  assert.ok(refused.logs.some((entry) => entry.level === 'warn'), 'a permanent refusal is a warning, once per round')
+test('an explicit false opt-out is carried through untouched', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'argon', reasoningEfforts: false }, { id: 'wide' }]) })
+  try {
+    await settle()
+    const written = writtenModels(stub.mutations)
+    assert.equal(written[0].reasoningEfforts, false)
+    assert.deepEqual(written[1].reasoningEfforts, DEFAULT_REASONING_EFFORTS, 'an id models.dev only calls non-reasoning still gets the standard set')
+  } finally {
+    stub.cleanup()
+  }
 })
 
-test('an unresolvable route is skipped for the fill and still swept by the cleanup', async () => {
-  const { ctx, mutations, logs, state } = contextFor({
-    user: userLayer(),
-    marker: RESIDUAL_INPUT_VERSION,
-    providers: [{ provider: 'verify-gateway', error: 'this route cannot be resolved' }],
-  })
-  apply(ctx)
-  await settle()
+test('a write that already landed settles, and repeated signals produce nothing', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]) })
+  try {
+    await settle()
+    const settled = stub.mutations.length
+    assert.equal(settled, 1)
 
-  assert.deepEqual(writesFor(mutations, 'llm-pi-ai'), [], 'the fill keeps its distance from a route that cannot be written')
-  assert.equal(Object.hasOwn(state.user.providers['verify-gateway'].models[0], 'input'), true, 'so the leftover list is left alone too, for this round')
-  assert.ok(logs.some((entry) => entry.level === 'warn' && entry.message.includes('unresolvable')), 'the skipped route is named')
+    for (let round = 0; round < 3; round += 1) {
+      stub.listeners.get('settings/document-updated')('llm-pi-ai')
+      await settle()
+    }
+    assert.equal(stub.mutations.length, settled, 'the computed values are in place, so the loop settles')
 
-  // The other half of the rule: the cleanup does not consult that list at all,
-  // because deleting a value cannot be refused for the reason a fill can.
-  const sweeping = contextFor({
-    user: userLayer(),
-    marker: undefined,
-    providers: [{ provider: 'verify-gateway', error: 'this route cannot be resolved' }],
-  })
-  apply(sweeping.ctx)
-  await settle()
-  assert.equal(Object.hasOwn(sweeping.state.user.providers['verify-gateway'].models[0], 'input'), false, 'the cleanup does not care whether the route resolves')
+    stub.listeners.get('settings/document-updated')('llm-deepseek')
+    await settle()
+    assert.equal(stub.mutations.length, settled, 'only this plugin’s namespace is a signal')
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('the plugin writes to the adapter’s namespace and nowhere else', async () => {
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }]) })
+  try {
+    await settle()
+    assert.ok(stub.mutations.length > 0)
+    for (const mutation of stub.mutations) {
+      assert.equal(mutation.ns, 'llm-pi-ai', 'no marker, no own config namespace: an uninstall leaves nothing in the profile patch')
+    }
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('a spent debounce timer releases its registration instead of piling up', async () => {
+  // Two long-lived effects (lifecycle + reconcile) plus at most one armed round:
+  // a harness that runs for weeks must not accumulate one passed-over effect per
+  // settings write.
+  const stub = mountWith({ user: userLayer([{ id: 'argon' }, { id: 'wide' }]) })
+  try {
+    await settle()
+    for (let round = 0; round < 5; round += 1) {
+      stub.listeners.get('settings/document-updated')('llm-pi-ai')
+      await settle()
+    }
+    assert.ok(stub.liveEffects().length <= 3, `expected at most three live effects, saw ${String(stub.liveEffects().length)}`)
+  } finally {
+    stub.cleanup()
+    assert.deepEqual(stub.liveEffects(), [], 'disposal clears whatever is left')
+  }
+})
+
+test('the row config tunes the timers and a stale marker object is ignored', async () => {
+  const stub = contextFor({ user: userLayer([{ id: 'argon' }]) })
+  const { fetchImpl } = transport([jsonResponse(DEV_DOCUMENT())])
+  try {
+    // The row config of a profile upgraded from 0.4.0 still carries the retired
+    // marker; it must be ignored, while the tuning keys are honoured.
+    apply(stub.ctx, { residualInputsReclaimed: 1, debounceMs: 5, reconcileIntervalMs: 10 ** 9, fetchImpl })
+    await settle()
+    assert.equal(stub.mutations.length, 1, 'the tuning keys are read and the unknown marker key is ignored')
+  } finally {
+    stub.cleanup()
+  }
+})
+
+test('a context whose settings namespace is absent is left alone', async () => {
+  const stub = contextFor({ user: userLayer([{ id: 'argon' }]) })
+  const withoutNamespace = { ...stub.ctx, settings: { describe: () => [] } }
+  const normalizer = createNormalizer({ debounceMs: 5, reconcileMs: 10 ** 9 })
+  try {
+    normalizer.mount(withoutNamespace)
+    await settle(40)
+    assert.deepEqual(stub.mutations, [], 'nothing is written, and nothing throws')
+  } finally {
+    stub.cleanup()
+  }
 })

@@ -1,19 +1,22 @@
 /**
- * Unit tests for the settings normalizer.
+ * Unit tests for the planning rules: what a model's `reasoningEfforts` becomes,
+ * what is left alone, and what the cleanup command is allowed to delete.
  *
- * Every fixture is a plain object: the planner is pure, so no Cordis runtime,
- * no settings service and no `llm` service is involved. The two shipped
- * functions the plans are judged against are mirrored here in miniature, with
- * the lines they mirror named — `resolveModelReasoning`'s `thinkingLevelMap`
- * construction (`dsh-llm-pi-ai/lib/index.js:575-580`) and pi-ai's level filter
- * (`@earendil-works/pi-ai/dist/models.js:551-560`) — so an inheritance case can
- * assert the level list the picker would actually show, not just the dict.
+ * Every fixture is a plain object: the planner is pure, so no Cordis runtime, no
+ * settings service and no I/O is involved. The two shipped functions the plans
+ * are judged against are mirrored here in miniature, with the lines they mirror
+ * named — `resolveModelReasoning`'s `thinkingLevelMap` construction
+ * (`dsh-llm-pi-ai/lib/index.js:575-580`) and pi-ai's level filter
+ * (`@earendil-works/pi-ai/dist/models.js:551-560`) — so a case can assert the
+ * level list the picker would actually show, not just the dict.
  *
- * The `input` modality list is not this planner's business any more: the
- * shipped Models settings page owns that field (`dsh-client-ui-settings-models`,
- * `inputField: "input"`), so the cases here only assert that the planner
- * carries an existing list through untouched. The one-shot cleanup of the
- * values the previous release wrote is covered by `test/reclaim.test.mjs`.
+ * The `input` modality list is not this planner's business: the shipped Models
+ * settings page owns that field (`dsh-client-ui-settings-models`,
+ * `inputField: "input"`), so the cases here only assert that the planner carries
+ * an existing list through untouched. The level source itself — the models.dev
+ * document, its union rule and its fetch state machine — is
+ * `test/modelsdev.test.mjs`; the command that deletes what this plugin wrote is
+ * `test/cleanup.test.mjs`.
  *
  * Run with `npm run test:host`.
  */
@@ -25,613 +28,268 @@ import {
   customModelIds,
   defaultReasoningEfforts,
   effortsForLevels,
+  isWrittenEfforts,
   planNormalization,
   plannedEfforts,
-  twinCapability,
   withoutRoutes,
 } from '../lib/normalize.js'
 
 // --- fixtures ---------------------------------------------------------------
 
-/** A persisted `llm-pi-ai` layer holding one custom route. */
-const snapshotOf = (models, { route = 'my-gateway', ...profile } = {}) => ({
-  providers: {
-    [route]: {
-      baseURL: 'https://gateway.example/v1',
-      api: 'openai-completions',
-      models,
-      ...profile,
-    },
-  },
+/** The two routes every case uses: the one this plugin owns, and a catalog one. */
+const CUSTOM = 'verify-gateway'
+const CATALOG = 'openai'
+
+/** A capability map as `lib/index.js` builds it from the models.dev index. */
+const catalogOf = (levels, catalogRoutes = [CATALOG]) => ({
+  catalogRoutes,
+  levels: new Map(Object.entries(levels)),
 })
 
-/** A capability map as `lib/index.js` builds it. */
-const catalogOf = (models, catalogRoutes = Object.keys(models)) => ({ catalogRoutes, models })
-
-/**
- * One model's capability fact, as `lib/index.js` captures it. The modality list
- * beside the levels is captured for the reclaim alone, so most cases leave it
- * `undefined` and only the ones that care pass it.
- */
-const reasons = (levels, modalities) => ({ reasoning: true, levels, modalities })
-const noReasoning = { reasoning: false, levels: [], modalities: undefined }
+/** A persisted `llm-pi-ai` layer holding the given models on the custom route. */
+const snapshotOf = (models, profile = {}) => ({
+  providers: { [CUSTOM]: { baseURL: 'https://gateway.example/v1', api: 'openai-completions', models, ...profile } },
+})
 
 /** The path op one route's models produce. */
-const opFor = (plan, route = 'my-gateway') => {
-  const op = plan.ops.find((entry) => entry.path.join('/') === `providers/${route}/models`)
-  assert.ok(op !== undefined, `expected an op for route ${route}, saw ${JSON.stringify(plan.ops)}`)
-  return op
-}
-
-/** The `reasoningEfforts` a plan writes for the first model of one route. */
-const effortsFor = (plan, route = 'my-gateway') => opFor(plan, route).value[0].reasoningEfforts
+const opFor = (plan, route = CUSTOM) => plan.ops.find((op) => op.path[1] === route)
 
 /**
- * One model entry without the capability field this planner owns, for the
- * "nothing else was touched" comparisons — `input` included, because the
- * planner must not restate, drop or reorder a list the settings page owns.
+ * The level list the shipped picker would show for one written dict.
+ *
+ * Mirrors pi-ai's `getSupportedThinkingLevels`
+ * (`@earendil-works/pi-ai/dist/models.js:551-560`) over the map
+ * `resolveModelReasoning` builds (`dsh-llm-pi-ai/lib/index.js:575-580`): a level
+ * declared with a wire spelling is offered, `off: null` leaves the map's `off`
+ * undefined and is therefore offered as "send nothing", and an absent level is
+ * mapped to null and dropped.
  */
-const withoutReasoning = (entry) => {
-  const rest = { ...entry }
-  delete rest.reasoningEfforts
-  return rest
-}
-
-// --- (a) twin with reasoning → inherit --------------------------------------
-
-test('(a) an unambiguous same-id catalog twin supplies its levels', () => {
-  // openai/gpt-5 as the installed catalog ships it: off and the extended levels
-  // are null-mapped, so the picker offers exactly these four.
-  const catalog = catalogOf({ openai: { 'gpt-5': reasons(['minimal', 'low', 'medium', 'high']) } })
-  const snapshot = snapshotOf([{ id: 'gpt-5' }])
-
-  const plan = planNormalization(snapshot, catalog)
-
-  assert.equal(plan.ops.length, 1)
-  assert.deepEqual(effortsFor(plan), {
-    minimal: 'minimal',
-    low: 'low',
-    medium: 'medium',
-    high: 'high',
-  })
-  // The twin does not offer `off`, so the dict must not declare it either:
-  // an undeclared level is pinned to null and stays out of the picker.
-  assert.equal(Object.hasOwn(effortsFor(plan), 'off'), false)
-  assert.deepEqual(plan.summary, {
-    routes: ['my-gateway'],
-    models: 1,
-    planned: 1,
-    optedOut: 0,
-    unchanged: 0,
-    inherited: 1,
-    defaulted: 0,
-    nonReasoning: 0,
-  })
-})
-
-test('(a) a twin offering off declares it as the valueless wire spelling', () => {
-  // deepseek-v4-flash: off is supported (absent from its map), minimal and
-  // medium are null-mapped.
-  const catalog = catalogOf({ deepseek: { 'deepseek-v4-flash': reasons(['off', 'low', 'high', 'max']) } })
-
-  const plan = planNormalization(snapshotOf([{ id: 'deepseek-v4-flash' }]), catalog)
-
-  assert.deepEqual(effortsFor(plan), { off: null, low: 'low', high: 'high', max: 'max' })
-})
-
-// --- (b) twin with reasoning:false → write false ----------------------------
-
-test('(b) a twin that does not reason is inherited as false', () => {
-  const catalog = catalogOf({ openai: { 'text-embedding-3-small': noReasoning } })
-
-  const plan = planNormalization(snapshotOf([{ id: 'text-embedding-3-small' }]), catalog)
-
-  assert.equal(plan.ops.length, 1)
-  assert.equal(effortsFor(plan), false)
-  assert.equal(plan.summary.nonReasoning, 1)
-})
-
-// --- (c) no twin → default set ----------------------------------------------
-
-test('(c) no twin falls back to the standard level set', () => {
-  const plan = planNormalization(snapshotOf([{ id: 'internal-model-v3' }]), catalogOf({ openai: { 'gpt-5': reasons(['high']) } }))
-
-  assert.equal(plan.ops.length, 1)
-  assert.deepEqual(effortsFor(plan), {
-    off: null,
-    minimal: 'minimal',
-    low: 'low',
-    medium: 'medium',
-    high: 'high',
-    xhigh: 'xhigh',
-    max: 'max',
-  })
-  assert.deepEqual(effortsFor(plan), { ...DEFAULT_REASONING_EFFORTS })
-  assert.equal(plan.summary.defaulted, 1)
-})
-
-test('(c) a model listed by no route at all still gets the standard set', () => {
-  const plan = planNormalization(snapshotOf([{ id: 'nothing-knows-me' }]), catalogOf({}))
-
-  assert.equal(plan.ops.length, 1)
-  assert.deepEqual(effortsFor(plan), { ...DEFAULT_REASONING_EFFORTS })
-})
-
-// --- (d) ambiguous twin → default set ---------------------------------------
-
-test('(d) twins that disagree fall back to the standard level set', () => {
-  const catalog = catalogOf({
-    openai: { 'shared-id': reasons(['minimal', 'low', 'medium', 'high']) },
-    anthropic: { 'shared-id': reasons(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) },
-  })
-
-  const plan = planNormalization(snapshotOf([{ id: 'shared-id' }]), catalog)
-
-  assert.deepEqual(effortsFor(plan), { ...DEFAULT_REASONING_EFFORTS })
-  assert.equal(plan.summary.defaulted, 1)
-  assert.equal(plan.summary.inherited, 0)
-})
-
-test('(d) a reasoning twin and a non-reasoning twin also disagree', () => {
-  const catalog = catalogOf({
-    openai: { 'shared-id': reasons(['high']) },
-    'some-gateway': { 'shared-id': noReasoning },
-  })
-
-  const plan = planNormalization(snapshotOf([{ id: 'shared-id' }]), catalog)
-
-  assert.deepEqual(effortsFor(plan), { ...DEFAULT_REASONING_EFFORTS })
-})
-
-test('(d) twins that agree are inherited', () => {
-  const catalog = catalogOf({
-    openai: { 'shared-id': reasons(['low', 'high']) },
-    openrouter: { 'shared-id': reasons(['low', 'high']) },
-    together: { 'shared-id': noReasoning },
-  })
-
-  assert.deepEqual(twinCapability(catalog, 'shared-id').status, 'ambiguous')
-  assert.deepEqual(twinCapability(catalogOf({ openai: { 'shared-id': reasons(['low', 'high']) }, openrouter: { 'shared-id': reasons(['high', 'low']) } }), 'shared-id'), {
-    status: 'agreed',
-    reasoning: true,
-    levels: ['low', 'high'],
-  })
-})
-
-test('(d) a conflicting modality list never decides the reasoning capability', () => {
-  // The modality half of a twin is captured for the reclaim alone. It must not
-  // reach the reasoning rules in either direction: here the two routes agree on
-  // the levels and disagree about images, and the levels are still inherited.
-  const catalog = catalogOf({
-    openai: { 'shared-id': reasons(['low', 'high'], ['text']) },
-    anthropic: { 'shared-id': reasons(['low', 'high'], ['text', 'image']) },
-  })
-
-  const plan = planNormalization(snapshotOf([{ id: 'shared-id' }]), catalog)
-
-  assert.deepEqual(effortsFor(plan), { low: 'low', high: 'high' })
-  assert.equal(plan.summary.inherited, 1)
-  assert.equal(plan.summary.defaulted, 0)
-})
-
-// --- (e) explicit false → no op ---------------------------------------------
-
-test('(e) an explicit false is an opt-out and is never overwritten', () => {
-  const catalog = catalogOf({ openai: { 'gpt-5': reasons(['high']) } })
-
-  const plan = planNormalization(snapshotOf([{ id: 'gpt-5', reasoningEfforts: false }]), catalog)
-
-  assert.deepEqual(plan.ops, [])
-  assert.equal(plan.summary.optedOut, 1)
-  assert.equal(plan.summary.planned, 0)
-})
-
-test('(e) an opted-out model keeps its value while its siblings are filled', () => {
-  const plan = planNormalization(
-    snapshotOf([{ id: 'my-embedding', reasoningEfforts: false }, { id: 'my-chat' }]),
-    catalogOf({}),
-  )
-
-  assert.equal(plan.ops.length, 1)
-  const models = opFor(plan).value
-  assert.equal(models[0].reasoningEfforts, false)
-  assert.deepEqual(models[1].reasoningEfforts, { ...DEFAULT_REASONING_EFFORTS })
-  assert.equal(plan.summary.optedOut, 1)
-  assert.equal(plan.summary.planned, 1)
-})
-
-// --- (f) already equal → no ops ---------------------------------------------
-
-test('(f) a model already carrying the computed value produces no ops', () => {
-  const plan = planNormalization(
-    snapshotOf([{ id: 'internal-model-v3', reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS } }]),
-    catalogOf({}),
-  )
-
-  assert.deepEqual(plan.ops, [])
-  assert.equal(plan.summary.unchanged, 1)
-})
-
-test('(f) an inherited value is idempotent on the next pass', () => {
-  const catalog = catalogOf({ anthropic: { 'claude-twin': reasons(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) } })
-  const first = planNormalization(snapshotOf([{ id: 'claude-twin' }]), catalog)
-  assert.equal(first.ops.length, 1)
-
-  // The write is the state the next pass reads, key order included: the same
-  // values must plan nothing, or the plugin would rewrite itself forever.
-  const written = opFor(first).value
-  const second = planNormalization(snapshotOf(written), catalog)
-
-  assert.deepEqual(second.ops, [])
-  assert.equal(second.summary.unchanged, 1)
-})
-
-test('(f) a reordered dict is still the same value', () => {
-  const plan = planNormalization(
-    snapshotOf([{
-      id: 'internal-model-v3',
-      reasoningEfforts: { max: 'max', high: 'high', off: null, minimal: 'minimal', medium: 'medium', low: 'low', xhigh: 'xhigh' },
-    }]),
-    catalogOf({}),
-  )
-
-  assert.deepEqual(plan.ops, [])
-  assert.equal(plan.summary.unchanged, 1)
-})
-
-// --- (g) catalog routes are never touched -----------------------------------
-
-test('(g) catalog routes are never touched', () => {
-  const catalog = catalogOf({ openai: { 'gpt-5': reasons(['high']) } })
-  const snapshot = {
-    providers: {
-      openai: {
-        apiKeyEnv: 'OPENAI_API_KEY',
-        models: [{ id: 'gpt-5' }, { id: 'gpt-4o' }],
-      },
-      'my-gateway': { baseURL: 'https://gateway.example/v1', models: [{ id: 'gpt-5' }] },
-    },
-  }
-
-  const plan = planNormalization(snapshot, catalog)
-
-  assert.equal(plan.ops.length, 1, 'only the custom route may be written')
-  assert.deepEqual(plan.ops[0].path, ['providers', 'my-gateway', 'models'])
-  assert.deepEqual(plan.summary.routes, ['my-gateway'])
-  assert.equal(plan.summary.models, 1, 'catalog-route models are not even counted')
-})
-
-test('(g) a provider layer holding only catalog routes plans nothing', () => {
-  const plan = planNormalization(
-    { providers: { openai: { models: [{ id: 'gpt-5' }] } } },
-    catalogOf({ openai: { 'gpt-5': reasons(['high']) } }),
-  )
-
-  assert.deepEqual(plan.ops, [])
-  assert.deepEqual(plan.summary.routes, [])
-})
-
-// --- (h) ops touch nothing on a model but reasoningEfforts ------------------
-
-test('(h) ops touch nothing on a model but its reasoning capability', () => {
-  const plan = planNormalization(
-    snapshotOf(
-      [
-        { id: 'gpt-5', name: 'Shared', contextWindow: 400000, input: ['text', 'image'] },
-        { id: 'my-embedding', reasoningEfforts: false },
-        { id: 'my-chat', compat: { thinkingFormat: 'deepseek' } },
-      ],
-      { displayName: 'Gateway', defaultMaxTokens: 8192 },
-    ),
-    catalogOf({ openai: { 'gpt-5': reasons(['minimal', 'low', 'medium', 'high']) } }),
-  )
-
-  assert.equal(plan.ops.length, 1)
-  const [op] = plan.ops
-  assert.equal(op.op, 'set')
-  // WHY the whole array: the shipped settings applier only descends through
-  // plain objects, so `['providers', route, 'models', '0', 'reasoningEfforts']`
-  // would replace the array with an object keyed "0" and the write would be
-  // rejected as `models expected array`. This assertion pins the shape that
-  // actually works, and the next ones pin what "only the capability field" means.
-  assert.deepEqual(op.path, ['providers', 'my-gateway', 'models'])
-
-  const before = snapshotOf([
-    { id: 'gpt-5', name: 'Shared', contextWindow: 400000, input: ['text', 'image'] },
-    { id: 'my-embedding', reasoningEfforts: false },
-    { id: 'my-chat', compat: { thinkingFormat: 'deepseek' } },
-  ]).providers['my-gateway'].models
-  assert.equal(op.value.length, before.length)
-  op.value.forEach((entry, index) => {
-    assert.deepEqual(withoutReasoning(entry), withoutReasoning(before[index]), `model ${entry.id} must keep every other field`)
-    assert.ok(isSchemaLegal(entry.reasoningEfforts), `model ${entry.id} must carry a legal effort value`)
-  })
-  assert.deepEqual(op.value[0].input, ['text', 'image'], 'the settings page owns this list; the planner restates it verbatim')
-  assert.deepEqual(Object.keys(op.value[0]), ['id', 'name', 'contextWindow', 'input', 'reasoningEfforts'], 'key order is preserved, the new field appended')
-  assert.deepEqual(Object.keys(op.value[1]), ['id', 'reasoningEfforts'], 'a stored key keeps its place, the filled one is appended')
-})
-
-test('(h) an input list is never restated, dropped, reordered or filled', () => {
-  // The settings page writes `input` on the same model entries this planner
-  // touches, so the two must not fight: a value already there is carried
-  // through exactly, and a model without one must not gain it.
-  for (const input of [['text'], ['text', 'image'], ['image', 'text'], ['image']]) {
-    const plan = planNormalization(
-      // The effort value is already the computed one, so the only thing that
-      // could produce a write here is the list — and it must not.
-      snapshotOf([{ id: 'my-chat', reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS }, input }]),
-      catalogOf({}),
-    )
-    assert.deepEqual(plan.ops, [], `input ${JSON.stringify(input)} must not be rewritten`)
-    assert.equal(plan.summary.unchanged, 1)
-  }
-
-  const noList = planNormalization(snapshotOf([{ id: 'my-chat' }]), catalogOf({}))
-  assert.equal(noList.ops.length, 1)
-  assert.equal(Object.hasOwn(opFor(noList).value[0], 'input'), false, 'no modality list may be invented')
-})
-
-test('(h) every op path stops at models and every value is a whole array', () => {
-  const plan = planNormalization(
-    {
-      providers: {
-        alpha: { models: [{ id: 'a' }] },
-        beta: { models: [{ id: 'b' }] },
-      },
-    },
-    catalogOf({}),
-  )
-
-  assert.equal(plan.ops.length, 2)
-  for (const op of plan.ops) {
-    assert.equal(op.op, 'set')
-    assert.equal(op.path.length, 3)
-    assert.equal(op.path[0], 'providers')
-    assert.equal(op.path[2], 'models')
-    assert.equal(op.path.includes('reasoningEfforts'), false, 'the applier cannot reach an array element')
-    assert.ok(Array.isArray(op.value))
-    assert.ok(op.value.every((entry) => Object.hasOwn(entry, 'reasoningEfforts')))
-  }
-})
-
-// --- schema legality --------------------------------------------------------
-
-/**
- * The shipped schema in miniature: keys are thinking levels, values are
- * non-empty wire strings, and `null` is lawful on `off` alone
- * (`dsh-llm-pi-ai/lib/index.js:1001`, `:571-574`).
- */
-const isSchemaLegal = (efforts) => {
-  if (efforts === false) return true
-  if (efforts === null || typeof efforts !== 'object' || Array.isArray(efforts)) return false
-  const keys = Object.keys(efforts)
-  if (keys.length === 0) return false
-  if (keys.some((level) => !THINKING_LEVELS.includes(level))) return false
-  if (keys.some((level) => (efforts[level] === null ? level !== 'off' : typeof efforts[level] !== 'string' || efforts[level].length === 0))) return false
-  return keys.some((level) => level !== 'off')
-}
-
-test('every planned value is schema-legal', () => {
-  const catalog = catalogOf({
-    openai: {
-      'gpt-5': reasons(['minimal', 'low', 'medium', 'high'], ['text', 'image']),
-      'text-embedding-3-small': { reasoning: false, levels: [], modalities: ['text'] },
-    },
-  })
-  const plan = planNormalization(
-    snapshotOf([
-      { id: 'gpt-5' },
-      { id: 'text-embedding-3-small' },
-      { id: 'unknown-model' },
-      { id: 'opt-out', reasoningEfforts: false },
-    ]),
-    catalog,
-  )
-
-  assert.equal(plan.ops.length, 1)
-  for (const entry of opFor(plan).value) {
-    assert.ok(isSchemaLegal(entry.reasoningEfforts), `${entry.id} carries an illegal effort value`)
-  }
-})
-
-test('the helpers never invent an illegal dict', () => {
-  assert.equal(effortsForLevels([]), undefined)
-  assert.equal(effortsForLevels(['off']), undefined)
-  assert.equal(effortsForLevels(['off', 'not-a-level']), undefined)
-  assert.deepEqual(effortsForLevels(['high']), { high: 'high' })
-  assert.deepEqual(effortsForLevels(['max', 'off']), { off: null, max: 'max' })
-  for (const levels of [[], ['off'], ['high'], ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']]) {
-    const dict = effortsForLevels(levels)
-    if (dict !== undefined) assert.ok(isSchemaLegal(dict))
-  }
-  assert.notEqual(defaultReasoningEfforts(), DEFAULT_REASONING_EFFORTS)
-})
-
-test('plannedEfforts names where a value came from', () => {
-  assert.deepEqual(plannedEfforts(catalogOf({}), 'anything'), { value: { ...DEFAULT_REASONING_EFFORTS }, source: 'default' })
-  assert.deepEqual(
-    plannedEfforts(catalogOf({ openai: { 'shared': reasons(['low']) }, anthropic: { 'shared': reasons(['high']) } }), 'shared'),
-    { value: { ...DEFAULT_REASONING_EFFORTS }, source: 'default-ambiguous' },
-  )
-  assert.deepEqual(plannedEfforts(catalogOf({ openai: { 'embedding': noReasoning } }), 'embedding'), { value: false, source: 'twin-non-reasoning' })
-  assert.deepEqual(plannedEfforts(catalogOf({ openai: { 'off-only': reasons(['off']) } }), 'off-only'), { value: false, source: 'twin-unexpressible' })
-  assert.deepEqual(plannedEfforts(catalogOf({ openai: { 'gpt-5': reasons(['low', 'high']) } }), 'gpt-5'), { value: { low: 'low', high: 'high' }, source: 'twin' })
-})
-
-// --- inheritance reproduces the twin's picker -------------------------------
-
-/**
- * `resolveModelReasoning`'s map construction
- * (`dsh-llm-pi-ai/lib/index.js:575-580`): a declared level keeps its spelling,
- * an undeclared one is pinned to null, and an `off: null` stays out of the map.
- */
-const thinkingLevelMap = (efforts) => {
+const pickerLevels = (efforts) => {
   const map = {}
   for (const level of THINKING_LEVELS) {
     const wire = efforts[level]
     if (wire === undefined) map[level] = null
     else if (wire !== null) map[level] = wire
   }
-  return map
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = map[level]
+    if (mapped === null) return false
+    if (level === 'xhigh' || level === 'max') return mapped !== undefined
+    return true
+  })
 }
 
-/**
- * `getSupportedThinkingLevels` (`@earendil-works/pi-ai/dist/models.js:551-560`):
- * null-mapped levels are unsupported, and `xhigh`/`max` need an explicit entry.
- */
-const supportedLevels = (map) => THINKING_LEVELS.filter((level) => {
-  const mapped = map[level]
-  if (mapped === null) return false
-  if (level === 'xhigh' || level === 'max') return mapped !== undefined
-  return true
+// --- the vocabulary ---------------------------------------------------------
+
+test('the level vocabulary is the harness’s, in escalation order', () => {
+  assert.deepEqual([...THINKING_LEVELS], ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(Object.keys(DEFAULT_REASONING_EFFORTS), [...THINKING_LEVELS])
+  assert.equal(DEFAULT_REASONING_EFFORTS.off, null, 'off is "send nothing", which only null expresses')
+  for (const level of THINKING_LEVELS) {
+    if (level === 'off') continue
+    assert.equal(DEFAULT_REASONING_EFFORTS[level], level, `${level} is spelled with its own name`)
+  }
 })
 
-test('an inherited dict reproduces exactly the levels the twin offers', () => {
-  const twins = [
-    { route: 'openai', id: 'gpt-5', levels: ['minimal', 'low', 'medium', 'high'] },
-    { route: 'anthropic', id: 'claude-fable-5', levels: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
-    { route: 'deepseek', id: 'deepseek-v4-flash', levels: ['off', 'low', 'high', 'max'] },
-    { route: 'xai', id: 'grok-4.5', levels: ['low', 'medium', 'high'] },
-  ]
-  const catalog = catalogOf(Object.fromEntries(twins.map((twin) => [twin.route, { [twin.id]: reasons(twin.levels) }])))
-  const plan = planNormalization(snapshotOf(twins.map((twin) => ({ id: twin.id }))), catalog)
-
-  assert.equal(plan.ops.length, 1)
-  const written = opFor(plan).value
-  twins.forEach((twin, index) => {
-    const map = thinkingLevelMap(written[index].reasoningEfforts)
-    assert.deepEqual(supportedLevels(map), twin.levels, `${twin.route}/${twin.id} must offer the same levels as its twin`)
-  })
+test('defaultReasoningEfforts hands back a fresh, mutable copy', () => {
+  const first = defaultReasoningEfforts()
+  first.max = 'changed'
+  assert.equal(defaultReasoningEfforts().max, 'max', 'the frozen standard set is never handed out directly')
 })
 
-// --- the custom-route id helper ---------------------------------------------
+// --- effortsForLevels -------------------------------------------------------
 
-test('customModelIds collects exactly the custom-route ids', () => {
+test('effortsForLevels spells each level as its own name and off as null', () => {
+  assert.deepEqual(effortsForLevels(['low', 'off', 'high']), { off: null, low: 'low', high: 'high' })
+  assert.deepEqual(Object.keys(effortsForLevels(['max', 'medium'])), ['medium', 'max'], 'the canonical order is the vocabulary order')
+  assert.deepEqual(pickerLevels(effortsForLevels(['off', 'low', 'max'])), ['off', 'low', 'max'], 'the picker offers exactly the declared set')
+})
+
+test('effortsForLevels refuses a set the schema cannot express', () => {
+  assert.equal(effortsForLevels([]), undefined)
+  assert.equal(effortsForLevels(['off']), undefined, 'nothing beyond off is not a declaration')
+  assert.equal(effortsForLevels(['off', 'bogus']), undefined, 'a level outside the vocabulary is not copied')
+  assert.equal(effortsForLevels(undefined), undefined)
+})
+
+// --- isWrittenEfforts -------------------------------------------------------
+//
+// This predicate is the cleanup command's whole safety argument: it decides what
+// may be deleted from a user's document, so both directions are pinned here.
+
+test('isWrittenEfforts recognizes exactly this plugin’s handwriting', () => {
+  assert.equal(isWrittenEfforts({ off: null, low: 'low', high: 'high' }), true)
+  assert.equal(isWrittenEfforts({ ...DEFAULT_REASONING_EFFORTS }), true, 'the standard set is this plugin’s own fallback')
+  assert.equal(isWrittenEfforts({ max: 'max' }), true, 'off is not required: the shape is the spelling')
+})
+
+test('isWrittenEfforts leaves anything a user could have written alone', () => {
+  assert.equal(isWrittenEfforts(false), false, 'the explicit opt-out is a decision, not a leftover')
+  assert.equal(isWrittenEfforts({ off: null }), false, 'a set with nothing beyond off is not a declaration')
+  assert.equal(isWrittenEfforts({ low: 'low', high: 'HIGH' }), false, 'another spelling is someone else’s declaration')
+  assert.equal(isWrittenEfforts({ off: 'none', low: 'low' }), false, 'off carries null in every declaration this plugin writes')
+  assert.equal(isWrittenEfforts({ low: 'reasoning_low' }), false)
+  assert.equal(isWrittenEfforts({ reasoning: false }), false)
+  assert.equal(isWrittenEfforts({}), false)
+  assert.equal(isWrittenEfforts(null), false)
+  assert.equal(isWrittenEfforts(['low']), false)
+})
+
+// --- plannedEfforts ---------------------------------------------------------
+
+test('plannedEfforts uses the level set models.dev declares', () => {
+  const { value, source } = plannedEfforts(catalogOf({ 'gemini-4-argon': ['off', 'low', 'medium', 'high'] }), 'gemini-4-argon')
+  assert.equal(source, 'models.dev')
+  assert.deepEqual(value, { off: null, low: 'low', medium: 'medium', high: 'high' })
+})
+
+test('plannedEfforts falls back to the standard set when models.dev names no level', () => {
+  const catalog = catalogOf({})
+  for (const id of ['gemini-3.8-flash-high', 'LongCat-2.5-Preview']) {
+    const { value, source } = plannedEfforts(catalog, id)
+    assert.equal(source, 'standard', `${id} is not described anywhere`)
+    assert.deepEqual(value, DEFAULT_REASONING_EFFORTS)
+  }
+  assert.equal(plannedEfforts(catalogOf({ 'only-off': ['off'] }), 'only-off').source, 'standard',
+    'an id whose only level is off cannot be declared, so it takes the standard set')
+  assert.equal(plannedEfforts(catalogOf({}), '').source, 'standard', 'an empty id names nothing')
+  assert.equal(plannedEfforts({ catalogRoutes: [] }, 'anything').source, 'standard', 'a map with no levels at all')
+  assert.equal(plannedEfforts(undefined, 'anything').source, 'standard')
+})
+
+test('plannedEfforts never declares a model non-reasoning', () => {
+  // The user's own `false` opt-out is preserved by the planner (case e); the
+  // plugin must not invent one, because a model it cannot describe deserves the
+  // picker rather than silence.
+  for (const catalog of [catalogOf({}), catalogOf({ x: ['off'] }), undefined]) {
+    assert.notEqual(plannedEfforts(catalog, 'x').value, false)
+  }
+})
+
+// --- customModelIds ---------------------------------------------------------
+
+test('customModelIds covers exactly the custom routes’ ids', () => {
   const snapshot = {
     providers: {
-      openai: { models: [{ id: 'gpt-5' }] },
-      'my-gateway': { models: [{ id: 'gpt-5' }, { id: 'my-chat' }, { id: '' }, { notAModel: true }] },
-      'not-a-profile': 'nonsense',
+      [CUSTOM]: { models: [{ id: 'a' }, { id: '' }, { id: 'b' }, { noId: true }] },
+      [CATALOG]: { models: [{ id: 'catalog-model' }] },
+      shapeless: { models: 'not a list' },
     },
   }
-
-  assert.deepEqual([...customModelIds(snapshot, ['openai'])].sort(), ['gpt-5', 'my-chat'])
-  assert.deepEqual([...customModelIds(snapshot, new Set(['openai']))].sort(), ['gpt-5', 'my-chat'])
+  assert.deepEqual([...customModelIds(snapshot, [CATALOG])].sort(), ['a', 'b'])
+  assert.deepEqual([...customModelIds({}, [])], [])
+  assert.deepEqual([...customModelIds(undefined, [])], [])
 })
 
-// --- dropping unwritable routes ---------------------------------------------
+// --- withoutRoutes ----------------------------------------------------------
 
-/** The layer the drop cases are judged on: two custom routes, plus a second top-level key. */
-const twoRoutes = () => ({
-  defaultRoute: 'my-gateway',
-  providers: {
-    broken: { baseURL: 'https://broken.example/v1', models: [{ id: 'broken-model' }] },
-    healthy: { baseURL: 'https://healthy.example/v1', models: [{ id: 'healthy-model' }] },
-  },
-})
-
-test('withoutRoutes drops exactly the named routes and keeps every other key', () => {
-  const snapshot = twoRoutes()
-  const brokenProfile = snapshot.providers.broken
-  const healthyProfile = snapshot.providers.healthy
-
-  const writable = withoutRoutes(snapshot, new Set(['broken']))
-
-  assert.deepEqual(Object.keys(writable.providers), ['healthy'])
-  // A surviving route is carried over by reference, not rebuilt: the planner
-  // must see the profile exactly as it was read, or its op would write back a
-  // different array than the one it decided about.
-  assert.equal(writable.providers.healthy, healthyProfile)
-  assert.equal(writable.defaultRoute, snapshot.defaultRoute)
-  assert.deepEqual(Object.keys(writable), ['defaultRoute', 'providers'])
-  // The input is filtered, never edited: the ops are applied to the real layer,
-  // so the dropped route is still in it after the call.
-  assert.equal(snapshot.providers.broken, brokenProfile)
-  assert.deepEqual(Object.keys(snapshot.providers), ['broken', 'healthy'])
-})
-
-test('withoutRoutes drops every route when every route is named', () => {
-  const writable = withoutRoutes(twoRoutes(), new Set(['broken', 'healthy']))
-
-  assert.deepEqual(writable.providers, {})
-  assert.equal(writable.defaultRoute, 'my-gateway', 'the other top-level keys survive an emptied provider layer')
-})
-
-test('withoutRoutes with nothing to drop returns the very input', () => {
-  const snapshot = twoRoutes()
-
-  assert.equal(withoutRoutes(snapshot, new Set()), snapshot)
-})
-
-test('withoutRoutes returns unreadable shapes unchanged instead of throwing', () => {
-  for (const snapshot of [undefined, null, 'nonsense', 42, [], {}, { providers: null }, { providers: [] }, { providers: 'nope' }]) {
-    assert.equal(
-      withoutRoutes(snapshot, new Set(['broken'])),
-      snapshot,
-      `snapshot ${JSON.stringify(snapshot) ?? String(snapshot)} must come back untouched`,
-    )
-  }
-  // A skip set that is not a set cannot name a route, so there is nothing to drop.
-  const snapshot = twoRoutes()
+test('withoutRoutes drops the named routes and nothing else', () => {
+  const snapshot = { providers: { a: { models: [] }, b: { models: [] } }, other: 1 }
+  const kept = withoutRoutes(snapshot, new Set(['a']))
+  assert.deepEqual(Object.keys(kept.providers), ['b'])
+  assert.equal(kept.other, 1, 'the rest of the layer travels through')
+  assert.equal(withoutRoutes(snapshot, new Set()), snapshot, 'an empty skip set is the input itself')
   assert.equal(withoutRoutes(snapshot, undefined), snapshot)
-  assert.equal(withoutRoutes(snapshot, null), snapshot)
-  assert.equal(withoutRoutes(snapshot, ['broken']), snapshot)
 })
 
-test('a skip set naming no existing route rebuilds the same layer', () => {
-  const snapshot = twoRoutes()
-  const writable = withoutRoutes(snapshot, new Set(['no-such-route']))
+// --- the plan ---------------------------------------------------------------
 
-  assert.deepEqual(writable, snapshot, 'no route is lost when no name matches')
-  assert.notEqual(writable, snapshot, 'a non-empty skip set rebuilds the layer rather than passing it through')
+test('(a) a models.dev level set is written with off as null', () => {
+  const plan = planNormalization(snapshotOf([{ id: 'my-chat' }]), catalogOf({ 'my-chat': ['off', 'low', 'high'] }))
+  assert.equal(plan.ops.length, 1)
+  assert.deepEqual(plan.ops[0].path, ['providers', CUSTOM, 'models'])
+  assert.deepEqual(opFor(plan).value[0].reasoningEfforts, { off: null, low: 'low', high: 'high' })
+  assert.deepEqual(pickerLevels(opFor(plan).value[0].reasoningEfforts), ['off', 'low', 'high'], 'the picker shows the declared set')
+  assert.equal(plan.summary.planned, 1)
+  assert.equal(plan.summary.sourced, 1)
+  assert.equal(plan.summary.defaulted, 0)
 })
 
-test('planning over a filtered layer normalizes exactly the routes left in it', () => {
-  const snapshot = twoRoutes()
-  const catalog = catalogOf({ openai: { 'healthy-model': reasons(['low', 'high']) } })
-
-  const plan = planNormalization(withoutRoutes(snapshot, new Set(['broken'])), catalog)
-
-  assert.equal(plan.ops.length, 1, 'the skipped route must produce no op')
-  assert.deepEqual(plan.ops[0].path, ['providers', 'healthy', 'models'], 'the op still addresses the real route key')
-  assert.deepEqual(plan.summary, {
-    routes: ['healthy'],
-    models: 1,
-    planned: 1,
-    optedOut: 0,
-    unchanged: 0,
-    inherited: 1,
-    defaulted: 0,
-    nonReasoning: 0,
-  })
-  assert.deepEqual(effortsFor(plan, 'healthy'), { low: 'low', high: 'high' })
-
-  // The contrast is the reason the filter exists: the unfiltered layer plans a
-  // second op for the route the llm service cannot resolve, and since the whole
-  // round is one mutation, that op would cost the healthy route its pass.
-  const unfiltered = planNormalization(snapshot, catalog)
-  assert.deepEqual(unfiltered.summary.routes, ['broken', 'healthy'])
-  assert.equal(unfiltered.ops.length, 2)
+test('(b) an id models.dev does not describe takes the standard set', () => {
+  const plan = planNormalization(snapshotOf([{ id: 'unknown-model' }]), catalogOf({}))
+  assert.deepEqual(opFor(plan).value[0].reasoningEfforts, DEFAULT_REASONING_EFFORTS)
+  assert.deepEqual(pickerLevels(opFor(plan).value[0].reasoningEfforts), [...THINKING_LEVELS], 'every level, off included, is selectable')
+  assert.equal(plan.summary.defaulted, 1)
+  assert.equal(plan.summary.sourced, 0)
 })
 
-// --- fail-safe on unknown shapes --------------------------------------------
+test('(c) the entry keeps every other field, key order included', () => {
+  const entry = { id: 'my-chat', name: 'My Chat', contextWindow: 8192, input: ['text', 'image'], compat: { supportsStore: false } }
+  const plan = planNormalization(snapshotOf([entry]), catalogOf({ 'my-chat': ['low'] }))
+  const written = opFor(plan).value[0]
+  assert.deepEqual(Object.keys(written), [...Object.keys(entry), 'reasoningEfforts'], 'reasoningEfforts is appended, nothing is reordered')
+  for (const [key, value] of Object.entries(entry)) assert.deepEqual(written[key], value)
+})
 
-test('unknown shapes plan nothing instead of throwing', () => {
-  const catalog = catalogOf({})
-  for (const snapshot of [undefined, null, 'nonsense', 42, {}, { providers: null }, { providers: [] }, { providers: { custom: null } }, { providers: { custom: { models: 'nope' } } }]) {
-    const plan = planNormalization(snapshot, catalog)
-    assert.deepEqual(plan.ops, [], `snapshot ${JSON.stringify(snapshot)} must plan nothing`)
+test('(d) several models on one route travel in one op', () => {
+  const plan = planNormalization(snapshotOf([{ id: 'a' }, { id: 'b' }]), catalogOf({ a: ['off', 'low'], b: ['off', 'high'] }))
+  assert.equal(plan.ops.length, 1, 'one op carries the route’s whole models array')
+  assert.deepEqual(opFor(plan).value.map((entry) => entry.reasoningEfforts), [{ off: null, low: 'low' }, { off: null, high: 'high' }])
+  assert.equal(plan.summary.models, 2)
+})
+
+test('(e) an explicit false is an opt-out, never overwritten', () => {
+  const plan = planNormalization(snapshotOf([{ id: 'my-chat', reasoningEfforts: false }]), catalogOf({ 'my-chat': ['off', 'low', 'high'] }))
+  assert.deepEqual(plan.ops, [], 'the declaration is a decision, so there is nothing to write')
+  assert.equal(plan.summary.optedOut, 1)
+  assert.equal(plan.summary.planned, 0)
+})
+
+test('(f) a value that already equals the computed one produces no op', () => {
+  const settled = { id: 'my-chat', reasoningEfforts: { off: null, low: 'low' } }
+  const plan = planNormalization(snapshotOf([settled]), catalogOf({ 'my-chat': ['off', 'low'] }))
+  assert.deepEqual(plan.ops, [], 'this is the loop breaker: the plugin’s own write re-triggers it')
+  assert.equal(plan.summary.unchanged, 1)
+
+  // …and a value that differs from the computed one is rewritten, because the
+  // field is derived state rather than a user declaration. This is also how a
+  // model that already carries the standard set narrows to what models.dev says.
+  const plan2 = planNormalization(snapshotOf([{ id: 'my-chat', reasoningEfforts: { ...DEFAULT_REASONING_EFFORTS } }]), catalogOf({ 'my-chat': ['off', 'low'] }))
+  assert.equal(plan2.summary.planned, 1, 'a narrower models.dev set replaces the standard set')
+  assert.deepEqual(opFor(plan2).value[0].reasoningEfforts, { off: null, low: 'low' })
+})
+
+test('(g) a route the installed catalog ships is never touched', () => {
+  const snapshot = { providers: { [CATALOG]: { models: [{ id: 'gpt-5' }] }, [CUSTOM]: { models: [{ id: 'my-chat' }] } } }
+  const plan = planNormalization(snapshot, catalogOf({ 'my-chat': ['low'], 'gpt-5': ['low'] }))
+  assert.deepEqual(plan.ops.map((op) => op.path), [['providers', CUSTOM, 'models']])
+  assert.deepEqual(plan.summary.routes, [CUSTOM])
+})
+
+test('(h) the op restates the current array and nothing more', () => {
+  const models = [{ id: 'a' }, { id: 'b', reasoningEfforts: { off: null, low: 'low' } }, { id: 'c', reasoningEfforts: false }]
+  const plan = planNormalization(snapshotOf(models, { displayName: 'Verify' }), catalogOf({ a: ['low'], b: ['off', 'low'] }))
+  const written = opFor(plan).value
+  assert.equal(written.length, 3, 'every entry stays')
+  assert.deepEqual(written[1], models[1], 'an already-correct entry is written back unchanged')
+  assert.deepEqual(written[2], models[2], 'the opt-out is carried through')
+  assert.equal(plan.summary.planned, 1)
+  assert.equal(plan.summary.unchanged, 1)
+  assert.equal(plan.summary.optedOut, 1)
+  assert.equal(plan.summary.models, 3, 'every id lands in exactly one counter')
+  assert.equal(plan.summary.planned + plan.summary.unchanged + plan.summary.optedOut, plan.summary.models)
+})
+
+test('a route with nothing to write contributes no op', () => {
+  const plan = planNormalization(
+    { providers: { [CUSTOM]: { models: [{ id: 'a', reasoningEfforts: false }] }, second: { models: [{ id: 'b' }] } } },
+    catalogOf({ a: ['low'], b: ['high'] }),
+  )
+  assert.deepEqual(plan.ops.map((op) => op.path), [['providers', 'second', 'models']], 'the settled route stays out of the plan')
+  assert.deepEqual(plan.summary.routes, [CUSTOM, 'second'], '…but it is still reported as one of this plugin’s routes')
+})
+
+test('a shapeless layer plans nothing instead of throwing', () => {
+  for (const snapshot of [undefined, null, {}, { providers: null }, { providers: { a: {} } }, { providers: { a: { models: 'x' } } }]) {
+    assert.deepEqual(planNormalization(snapshot, catalogOf({})).ops, [])
   }
-  for (const broken of [undefined, null, 'nonsense', { models: null }, { catalogRoutes: null, models: [] }]) {
-    const plan = planNormalization(snapshotOf([{ id: 'a' }]), broken)
-    assert.equal(plan.ops.length, 1, `catalog ${JSON.stringify(broken)} must fall back to the default set`)
-    assert.deepEqual(effortsFor(plan), { ...DEFAULT_REASONING_EFFORTS })
-  }
-})
-
-test('entries that cannot carry an id are left exactly as they are', () => {
-  const plan = planNormalization(snapshotOf([{ name: 'no id' }, null, 'nonsense']), catalogOf({}))
-
-  assert.deepEqual(plan.ops, [])
+  const plan = planNormalization({ providers: { a: { models: [{ id: '' }, null, 'text'] } } }, catalogOf({}))
+  assert.deepEqual(plan.ops, [], 'entries without a usable id are skipped, not invented')
   assert.equal(plan.summary.models, 0)
+})
+
+test('the catalog route set may arrive as a Set as well as a list', () => {
+  const snapshot = snapshotOf([{ id: 'my-chat' }])
+  assert.deepEqual(planNormalization(snapshot, { catalogRoutes: new Set([CATALOG]), levels: new Map() }).ops.length, 1)
+  assert.deepEqual(planNormalization(snapshot, { catalogRoutes: [CUSTOM], levels: new Map() }).summary.routes, [])
 })

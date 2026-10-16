@@ -128,12 +128,21 @@ test('packaging: the sub-package ships, the postinstall links it, and the row re
       'effort-memory/locale/en.json',
       'effort-memory/locale/zh.json',
       'scripts/link-effort-memory-package.mjs',
+      // The two files the plugin half is useless without: the live capability
+      // source, and the command that takes its declarations back out again.
+      'lib/modelsdev.js',
+      'lib/normalize.js',
+      'scripts/cleanup.mjs',
       'cordis.patch.yml',
     ]) {
       assert.ok(rels.includes(shipped), `the artifact is missing ${shipped}; top-level entries: ${[...new Set(rels.map((rel) => rel.split('/')[0]))].join(', ')}`)
     }
     assert.ok(!rels.some((rel) => rel.startsWith('node_modules/')),
       'the artifact must not carry repository node_modules content: pnpm drops it, and it would mask the real resolution')
+    assert.ok(
+      JSON.parse(readFileSync(join(extract, 'package.json'), 'utf8')).dependencies?.yaml !== undefined,
+      'the cleanup command needs its YAML editor to be a declared dependency of the artifact',
+    )
 
     // 2) The artifact's own wiring has to be the wiring under test.
     const shippedManifest = JSON.parse(readFileSync(join(extract, 'package.json'), 'utf8'))

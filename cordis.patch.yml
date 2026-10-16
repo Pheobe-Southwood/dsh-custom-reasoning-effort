@@ -7,12 +7,18 @@
 # never hand-edit their profile's cordis.patch.yml for this plugin.
 #
 #   - custom-reasoning-effort  the settings normalizer: it fills the per-model
-#                              reasoningEfforts of custom-provider routes so the
+#                              reasoningEfforts of custom-provider routes — the
+#                              level sets read live from models.dev — so the
 #                              official 推理等级 picker appears.
 #   - effort-memory            the effort memory: it remembers the level last
 #                              actually in effect per (provider, model) route
 #                              and re-issues one selection when a session
 #                              switches back to that model.
+#
+# Removing this package does not remove the level declarations the normalizer
+# wrote into `llm-pi-ai` (only the user's own document can hold them). Run
+# `node scripts/cleanup.mjs --profile <name> --write` with the harness stopped
+# before or after an uninstall to take them back out; see the README.
 #
 # WHY the second component is a SEPARATE ROW of a SEPARATE PACKAGE rather than a
 # second module of this one:
@@ -65,23 +71,19 @@
 # re-issues a selection through the public session command face), so both sit
 # loose in the host root realm — no `isolate` realm is needed here.
 #
-# The normalizer's `config` block is its own marker slot, and it is deliberately
-# empty: `residualInputsReclaimed` is written into it, on first run, by the
-# one-shot cleanup of the `input` lists the 0.2.x releases of this plugin left
-# in the profile's `llm-pi-ai` section. Keeping the block here is what makes the
-# row configurable — a Loader entry with no `config` has no settings namespace
-# to write to — and keeping its one field volatile is what lets the cleanup
-# persist through the settings seam. Deleting the field by hand re-runs the
-# cleanup once on the next start; see the README's upgrade section.
-#
-# The memory row carries no `config` block, and needs none: it persists nothing
-# through the settings seam (its state is the storage domain `effort_memory`),
-# so it has no marker to keep.
+# Neither row carries a `config` block, and that is deliberate. Until 0.4.0 the
+# normalizer kept a migration marker (`residualInputsReclaimed`) in one, because
+# the one-shot cleanup of the `input` lists the 0.2.x releases wrote needed
+# somewhere to record that it had run. Both the cleanup and the marker are gone:
+# the Models settings page owns that field now, and the marker was this plugin's
+# only write outside `llm-pi-ai`. With no `config` block the row has no settings
+# namespace of its own, so an uninstall leaves nothing in a profile's patch file;
+# `scripts/cleanup.mjs` removes the level declarations this plugin wrote. The
+# memory row never had one: its state is the storage domain `effort_memory`.
 
 - insert:
     - id: custom-reasoning-effort
       name: dsh-custom-reasoning-effort
-      config: {}
 
     - id: effort-memory
       name: dsh-effort-memory

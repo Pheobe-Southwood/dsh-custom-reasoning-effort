@@ -17,9 +17,10 @@
  *     `npm pack` artifact; here it is pinned against silent edits.
  *
  * The patch is parsed by a shape-specific reader rather than a YAML dependency:
- * this package deliberately has no runtime dependencies beyond the harness's own
- * schema library (see below), and the file's shape is one `insert:` list of
- * `id`/`name` scalars (see the file's own comments).
+ * the plugin half deliberately has no runtime dependencies at all (the one
+ * dependency this package ships is for the cleanup command; see below), and the
+ * file's shape is one `insert:` list of `id`/`name` scalars (see the file's own
+ * comments).
  *
  * Run with `npm run test:mount`.
  */
@@ -52,18 +53,19 @@ assert.equal(
 
 // --- runtime dependencies ---------------------------------------------------
 //
-// The reclaim marker needs a settings namespace of this plugin's own, and the
-// settings service derives those from active Loader entries whose runtime
-// declares a `Config` schema (`dsh-settings/lib/index.js:539`). That is the one
-// reason this package ships a runtime dependency at all, so the set is pinned
-// here rather than left to grow: it is the harness's own schema library, versioned
-// in lockstep with the harness, and nothing else.
-const allowedRuntimeDependencies = ['@deepseek-ai/schemastery']
+// This package deliberately has almost no runtime dependencies. The plugin half
+// imports Node builtins only — the level source is `fetch` and the planning is
+// pure — so nothing it mounts needs a library. The one exception is the cleanup
+// command (`scripts/cleanup.mjs`), which edits a user's profile patch and must
+// therefore preserve its comments and key order: that needs a real YAML
+// document editor, and `yaml` is the one this harness itself uses. The set is
+// pinned here rather than left to grow.
+const allowedRuntimeDependencies = ['yaml']
 const runtimeDependencies = Object.keys(manifest.dependencies ?? {}).sort()
 assert.deepEqual(
   runtimeDependencies,
   allowedRuntimeDependencies,
-  `the only runtime dependency may be ${allowedRuntimeDependencies.join(', ')}: it is what makes the plugin's own row configurable`,
+  `the only runtime dependency may be ${allowedRuntimeDependencies.join(', ')}: it is what lets the cleanup command edit a patch document without reformatting it`,
 )
 for (const [dependency, range] of Object.entries(manifest.dependencies ?? {})) {
   assert.equal(typeof range, 'string', `${dependency} must pin a range`)
@@ -71,8 +73,8 @@ for (const [dependency, range] of Object.entries(manifest.dependencies ?? {})) {
 }
 assert.equal(
   manifest.dependencies?.['@deepseek-ai/schemastery'],
-  '~3.18.4',
-  'the schema library is pinned to the harness-compatible line, so a drift can only come from an explicit edit',
+  undefined,
+  'the schema library is gone with the row config it existed for: this plugin has no settings namespace of its own',
 )
 
 // --- how the sub-package reaches the runtime resolution ---------------------
@@ -128,31 +130,35 @@ assert.equal(typeof entry.apply, 'function', 'apply is exported')
 assert.deepEqual(
   entry.inject,
   ['llm', 'settings'],
-  'the entry declares the catalog and settings services it needs — and nothing else: `config` is the entry value the marker is read from, and injecting it would leave the plugin pending forever',
+  'the entry declares the catalog and settings services it needs — and nothing else',
 )
-assert.equal(typeof entry.Config, 'function', 'the entry declares a Config schema, which is what makes its own row a writable settings namespace')
+assert.equal(
+  entry.Config,
+  undefined,
+  'the entry declares no Config: this plugin writes the adapter’s namespace and none of its own, which is what an uninstall leaves nothing behind',
+)
 
-// --- the row config, which is also the reclaim marker ----------------------
+// --- the level source, which must actually ship -----------------------------
 //
-// The one-shot cleanup writes `residualInputsReclaimed` into this plugin's own
-// row config, so two properties are load-bearing and are asserted here: the
-// field exists in the schema (an undeclared path is refused by the settings
-// seam), and it is VOLATILE (only schema-declared volatile fields survive a
-// settings write). Losing either turns the cleanup into a permanently re-armed
-// deletion, which is the one failure mode this plugin must not have.
-const configSchema = entry.Config.toJSON()
-const configDict = configSchema.refs[configSchema.uid]?.dict ?? {}
-const configFieldNames = Object.keys(configDict)
-assert.equal(configFieldNames.length, 1, `the marker schema carries exactly one field, saw ${configFieldNames.join(', ')}`)
-assert.equal(
-  configFieldNames[0],
-  'residualInputsReclaimed',
-  'the marker field is the one the reclaim reads and writes',
-)
-assert.equal(
-  configSchema.refs[configDict[configFieldNames[0]]]?.meta?.volatile,
-  true,
-  'the marker must be volatile: a settings write keeps nothing else',
+// The plugin half is only as good as the module it fetches from, and a missing
+// `lib/modelsdev.js` would still leave the entry importing cleanly from a stale
+// copy. The module is asserted by name and by behaviour, not just by import.
+const modelsdev = await import(new URL('lib/modelsdev.js', root))
+assert.equal(typeof modelsdev.createLevelCatalog, 'function', 'the live models.dev source is exported')
+assert.equal(modelsdev.MODELS_DEV_URL, 'https://models.dev/api.json', 'the capability source is models.dev, not the installed catalog')
+const fixture = modelsdev.buildLevelIndex({
+  p: { models: { m: { id: 'm', reasoning_options: [{ type: 'effort', values: ['low', 'high'] }] } } },
+})
+assert.deepEqual(fixture.levels.get('m'), ['off', 'low', 'high'], 'one document becomes one level set, off included')
+
+// --- the cleanup command, which is the uninstall story ----------------------
+
+const cleanup = await readFile(new URL('scripts/cleanup.mjs', root), 'utf8')
+assert.ok(cleanup.includes("from '../lib/normalize.js'"), 'the cleanup command reuses the planner’s handwriting predicate')
+assert.ok(cleanup.includes('isWrittenEfforts'), 'the cleanup command deletes only what this plugin wrote')
+assert.ok(
+  manifest.files?.includes('scripts'),
+  'scripts/ must ship, or the cleanup command never reaches an install',
 )
 
 // Every module must import cleanly: a broken sibling would activate a plugin
@@ -209,8 +215,8 @@ const insertedRows = stripped.split('\n').filter((line) => /^\s{4}-\s/.test(line
 assert.equal(insertedRows.length, rows.length, `the insert carries exactly one row per component, saw ${insertedRows.length}`)
 assert.equal(
   stripped.match(/^\s{6}config:\s*\{\}\s*$/gm)?.length,
-  1,
-  'exactly one row carries a config block: only the normalizer keeps a marker there, and an entry with no config has no namespace to write it to',
+  undefined,
+  'neither row carries a config block: with no marker to keep, a config block would only invite a write this plugin does not need',
 )
 
 // The sub-package's own half has to be mountable by that row.

@@ -1,6 +1,6 @@
 {
   "name": "dsh-effort-memory",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Remember the reasoning effort last in effect per (provider, model) route and restore it when a session switches back",
   "type": "module",
